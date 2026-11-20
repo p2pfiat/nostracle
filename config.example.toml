@@ -1,0 +1,34 @@
+# Copy to config.toml and adjust.
+key_file = "data/oracle.key"
+db_file  = "data/events.json"   # BACK UP together with the key (see README)
+
+relays = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://relay.primal.net",
+]
+min_relay_acks   = 2            # published = accepted by at least this many relays
+rebroadcast_secs = 21600        # re-send recent events every 6h
+
+pairs = ["USD", "EUR"]
+
+num_digits    = 20              # max attestable price 1_048_575
+min_sources   = 3
+max_deviation = 0.01            # 1%
+max_attest_delay_secs = 3600    # later than this: event is MISSED, contracts refund
+archive_after_secs    = 604800  # move finished events to events.archive.jsonl after 7 days
+tick_secs = 30
+
+# Event schedules. A maturity shared by two series is one event.
+[[series]]                      # short-term: hourly, 2 days ahead
+interval_secs = 3600
+horizon_secs  = 172800
+
+[[series]]                      # contract maturities: daily 00:00 UTC, 90 days ahead
+interval_secs = 86400
+horizon_secs  = 7776000
+
+[profile]
+name  = "nostracle"
+# lud16 = "you@your-lightning-address.com"   # receive zaps
+# website = "https://github.com/p2pfiat/nostracle"
