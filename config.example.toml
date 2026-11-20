@@ -1,0 +1,23 @@
+# Copy to config.toml and adjust.
+key_file = "data/oracle.key"
+db_file  = "data/events.json"   # BACK UP together with the key
+
+relays = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://relay.primal.net",
+]
+
+pairs = ["USD", "EUR"]
+interval_secs = 3600        # one event per pair per hour
+horizon_secs  = 172800      # announce 48h ahead
+num_digits    = 20          # max attestable price 1_048_575
+min_sources   = 3
+max_deviation = 0.01        # 1%
+max_attest_delay_secs = 3600
+tick_secs = 30
+
+[profile]
+name  = "nostracle"
+# lud16 = "you@your-lightning-address.com"   # receive zaps
+# website = "https://github.com/p2pfiat/nostracle"
