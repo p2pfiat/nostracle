@@ -47,3 +47,29 @@ async fn announce_attest_survives_restart() {
         .await
         .is_err());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn archive_and_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("events.json");
+    let oracle = Oracle::from_signing_key(FileStorage::create(&db).unwrap(), key()).unwrap();
+    for m in [1000u32, 5000] {
+        oracle
+            .create_numeric_event(format!("btcusd-{m}"), 4, false, 0, "USD".into(), m)
+            .await
+            .unwrap();
+    }
+    oracle.storage.mark_missed("btcusd-1000").unwrap();
+    assert_eq!(oracle.storage.archive_before(2000).unwrap(), 1);
+    assert_eq!(oracle.storage.list_events().len(), 1);
+    assert!(oracle.storage.missed().is_empty());
+    let archived = std::fs::read_to_string(oracle.storage.archive_path()).unwrap();
+    assert!(archived.contains("btcusd-1000") && archived.contains("\"missed\":true"));
+
+    // archiving never rewinds the nonce counter
+    assert_eq!(oracle.storage.next_nonce_index(), 8);
+    assert_eq!(oracle.storage.bump_nonces(1000).unwrap(), 1008);
+    drop(oracle);
+    assert_eq!(FileStorage::open(&db).unwrap().next_nonce_index(), 1008);
+    assert!(FileStorage::create(&db).is_err(), "create must not overwrite");
+}

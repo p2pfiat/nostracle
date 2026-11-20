@@ -1,4 +1,4 @@
-//! Crash-safe JSON file storage for kormir.
+//! Crash-safe JSON file storage for kormir, plus nostr publication state.
 //!
 //! Safety-critical invariants for a DLC oracle:
 //! 1. A nonce index is never handed out twice (would leak the oracle key
@@ -7,26 +7,48 @@
 //! 2. An event is never signed twice with different outcomes (same key leak).
 //!    `save_signatures` refuses if signatures already exist.
 //!
-//! Every mutation rewrites the whole file via write-to-temp + rename.
+//! Every mutation rewrites the whole file via write-to-temp + rename. Finished
+//! events are moved to an append-only archive so the live file stays small.
 
 use anyhow::{Context, Result};
 use kormir::error::Error as KError;
 use kormir::storage::{OracleEventData, Storage};
 use kormir::{OracleAnnouncement, Signature};
+use nostr_sdk::Event;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Signed nostr events for one oracle event and how many relays took them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NostrRecord {
+    pub announcement: Option<Event>,
+    pub announcement_acks: usize,
+    pub attestation: Option<Event>,
+    pub attestation_acks: usize,
+    pub last_broadcast: u64,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
     next_nonce_index: u32,
     events: BTreeMap<String, OracleEventData>,
+    #[serde(default)]
+    nostr: BTreeMap<String, NostrRecord>,
+    /// Events that reached `max_attest_delay` without a reliable price.
+    #[serde(default)]
+    missed: BTreeSet<String>,
 }
 
 pub struct FileStorage {
     path: PathBuf,
     state: Mutex<State>,
+}
+
+pub fn maturity(ev: &OracleEventData) -> u64 {
+    ev.announcement.oracle_event.event_maturity_epoch as u64
 }
 
 impl FileStorage {
@@ -44,15 +66,30 @@ impl FileStorage {
         Ok(Self { path, state: Mutex::new(state) })
     }
 
+    /// Create an empty database file; fails if one exists.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        anyhow::ensure!(!path.exists(), "{path:?} already exists");
+        let s = Self::open(path)?;
+        s.persist(&s.state.lock().unwrap()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(s)
+    }
+
+    pub fn archive_path(&self) -> PathBuf {
+        self.path.with_extension("archive.jsonl")
+    }
+
     fn persist(&self, state: &State) -> Result<(), KError> {
         let tmp = self.path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(state).map_err(|_| KError::Internal)?;
-        std::fs::write(&tmp, bytes).map_err(|e| {
-            log::error!("write {tmp:?}: {e}");
-            KError::StorageFailure
-        })?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            log::error!("rename {tmp:?}: {e}");
+        let bytes = serde_json::to_vec(state).map_err(|_| KError::Internal)?;
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &self.path)
+        };
+        write().map_err(|e| {
+            log::error!("persist {:?}: {e}", self.path);
             KError::StorageFailure
         })
     }
@@ -61,22 +98,83 @@ impl FileStorage {
         self.state.lock().unwrap().events.values().cloned().collect()
     }
 
-    /// Record the nostr event ids under which announcement/attestation were published.
-    pub fn set_nostr_ids(
-        &self,
-        event_id: &str,
-        announcement: Option<String>,
-        attestation: Option<String>,
-    ) -> Result<(), KError> {
+    pub fn next_nonce_index(&self) -> u32 {
+        self.state.lock().unwrap().next_nonce_index
+    }
+
+    pub fn nostr_record(&self, event_id: &str) -> NostrRecord {
+        self.state.lock().unwrap().nostr.get(event_id).cloned().unwrap_or_default()
+    }
+
+    pub fn update_nostr(&self, event_id: &str, f: impl FnOnce(&mut NostrRecord)) -> Result<()> {
         let mut st = self.state.lock().unwrap();
-        let ev = st.events.get_mut(event_id).ok_or(KError::NotFound)?;
-        if announcement.is_some() {
-            ev.announcement_event_id = announcement;
+        f(st.nostr.entry(event_id.to_string()).or_default());
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub fn is_missed(&self, event_id: &str) -> bool {
+        self.state.lock().unwrap().missed.contains(event_id)
+    }
+
+    pub fn mark_missed(&self, event_id: &str) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.missed.insert(event_id.to_string()) {
+            self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        if attestation.is_some() {
-            ev.attestation_event_id = attestation;
+        Ok(())
+    }
+
+    pub fn missed(&self) -> Vec<String> {
+        self.state.lock().unwrap().missed.iter().cloned().collect()
+    }
+
+    /// Skip the nonce counter ahead. Run after restoring an older backup so
+    /// that nonces handed out after the backup are never reused.
+    pub fn bump_nonces(&self, by: u32) -> Result<u32> {
+        let mut st = self.state.lock().unwrap();
+        st.next_nonce_index = st
+            .next_nonce_index
+            .checked_add(by)
+            .filter(|n| *n < (1 << 31))
+            .ok_or_else(|| anyhow::anyhow!("nonce index would overflow"))?;
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(st.next_nonce_index)
+    }
+
+    /// Move events with maturity before `cutoff` to the archive file.
+    /// Returns how many were archived.
+    pub fn archive_before(&self, cutoff: u64) -> Result<usize> {
+        let mut st = self.state.lock().unwrap();
+        let old: Vec<String> = st
+            .events
+            .values()
+            .filter(|e| maturity(e) < cutoff)
+            .map(|e| e.event_id.clone())
+            .collect();
+        if old.is_empty() {
+            return Ok(0);
         }
-        self.persist(&st)
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.archive_path())?;
+        for id in &old {
+            let ev = st.events.get(id).unwrap();
+            let line = serde_json::json!({
+                "event": ev,
+                "nostr": st.nostr.get(id),
+                "missed": st.missed.contains(id),
+            });
+            writeln!(f, "{line}")?;
+        }
+        f.sync_all()?;
+        for id in &old {
+            st.events.remove(id);
+            st.nostr.remove(id);
+            st.missed.remove(id);
+        }
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(old.len())
     }
 }
 
@@ -84,7 +182,10 @@ impl Storage for FileStorage {
     async fn get_next_nonce_indexes(&self, num: usize) -> Result<Vec<u32>, KError> {
         let mut st = self.state.lock().unwrap();
         let start = st.next_nonce_index;
-        let end = start.checked_add(num as u32).ok_or(KError::Internal)?;
+        let end = start
+            .checked_add(num as u32)
+            .filter(|n| *n < (1 << 31)) // hardened derivation limit
+            .ok_or(KError::Internal)?;
         st.next_nonce_index = end;
         self.persist(&st)?;
         Ok((start..end).collect())

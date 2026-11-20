@@ -1,6 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use nostracle::{config::Config, oracle, price, storage::FileStorage};
+use nostr_sdk::prelude::*;
+use nostracle::{config::Config, nip88, oracle, price, storage::FileStorage};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -30,6 +32,22 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
+    /// Health check for monitoring. Prints JSON; exit code 1 if unhealthy.
+    Status,
+    /// Fetch an oracle's events from the relays and verify them like a DLC client.
+    Verify {
+        /// Oracle pubkey (hex or npub). Defaults to this oracle's key.
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// Only events created in the last N seconds.
+        #[arg(long, default_value_t = 86400)]
+        since_secs: u64,
+    },
+    /// Skip the nonce counter ahead. REQUIRED after restoring an older db backup.
+    BumpNonces {
+        #[arg(long)]
+        by: u32,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -47,15 +65,11 @@ async fn main() -> Result<()> {
                 std::fs::create_dir_all(d)?;
             }
             std::fs::write(&cfg.key_file, hex::encode(key.secret_bytes()))?;
-            drop(FileStorage::open(&cfg.db_file)?);
-            // Persist an empty state so `run` sees the db exists.
-            std::fs::write(&cfg.db_file, r#"{"next_nonce_index":0,"events":{}}"#)?;
+            FileStorage::create(&cfg.db_file)?;
             println!("created {:?} and {:?}. Back up BOTH.", cfg.key_file, cfg.db_file);
         }
         Cmd::Pubkey => {
-            let key = oracle::load_key(&cfg.key_file)?;
-            let keys = nostr_sdk::Keys::new(nostr_sdk::SecretKey::from_slice(&key.secret_bytes())?);
-            use nostr_sdk::ToBech32;
+            let keys = own_keys(&cfg)?;
             println!("{}\n{}", keys.public_key().to_hex(), keys.public_key().to_bech32()?);
         }
         Cmd::Price => {
@@ -91,6 +105,90 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Status => {
+            let s = oracle::status(&cfg)?;
+            println!("{}", serde_json::to_string_pretty(&s)?);
+            if !s.healthy {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Verify { pubkey, since_secs } => {
+            let pk = match pubkey {
+                Some(p) => PublicKey::parse(&p)?,
+                None => own_keys(&cfg)?.public_key(),
+            };
+            std::process::exit(verify(&cfg, pk, since_secs).await?);
+        }
+        Cmd::BumpNonces { by } => {
+            let st = FileStorage::open(&cfg.db_file)?;
+            println!("next nonce index now {}", st.bump_nonces(by)?);
+        }
     }
     Ok(())
+}
+
+fn own_keys(cfg: &Config) -> Result<Keys> {
+    let key = oracle::load_key(&cfg.key_file)?;
+    Ok(Keys::new(SecretKey::from_slice(&key.secret_bytes())?))
+}
+
+/// Returns the process exit code: 0 if everything verified.
+async fn verify(cfg: &Config, pk: PublicKey, since_secs: u64) -> Result<i32> {
+    let client = Client::default();
+    for r in &cfg.relays {
+        client.add_relay(r.as_str()).await?;
+    }
+    client.connect().await;
+    client.wait_for_connection(Duration::from_secs(10)).await;
+    let since = Timestamp::from(oracle::now().saturating_sub(since_secs));
+    let filter = Filter::new()
+        .author(pk)
+        .kinds([Kind::Custom(nip88::KIND_ANNOUNCEMENT), Kind::Custom(nip88::KIND_ATTESTATION)])
+        .since(since);
+    let events = client
+        .fetch_events(filter, Duration::from_secs(20))
+        .await
+        .context("fetch events")?;
+    client.disconnect().await;
+
+    let (anns, atts): (Vec<Event>, Vec<Event>) = events
+        .into_iter()
+        .partition(|e| e.kind == Kind::Custom(nip88::KIND_ANNOUNCEMENT));
+    let mut bad = 0;
+    let mut by_id = HashMap::new();
+    for e in &anns {
+        match nip88::verify_announcement(e) {
+            Ok(a) => {
+                by_id.insert(e.id, (e, a));
+            }
+            Err(err) => {
+                bad += 1;
+                println!("INVALID announcement {}: {err:#}", e.id);
+            }
+        }
+    }
+    let mut ok_att = 0;
+    for e in &atts {
+        let ann_id = e.tags.event_ids().next().copied();
+        let Some((ann_ev, ann)) = ann_id.and_then(|id| by_id.get(&id)) else {
+            println!("attestation {} references an announcement not fetched (older than --since-secs?)", e.id);
+            continue;
+        };
+        match nip88::verify_attestation(e, ann_ev, ann) {
+            Ok((att, v)) => {
+                ok_att += 1;
+                println!("ok  {} = {v}", att.event_id);
+            }
+            Err(err) => {
+                bad += 1;
+                println!("INVALID attestation {}: {err:#}", e.id);
+            }
+        }
+    }
+    println!(
+        "{} announcements valid, {ok_att} attestations valid, {bad} invalid (pubkey {})",
+        by_id.len(),
+        pk.to_bech32()?
+    );
+    Ok(if bad == 0 && !by_id.is_empty() { 0 } else { 1 })
 }
