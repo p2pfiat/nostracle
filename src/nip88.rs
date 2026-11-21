@@ -59,7 +59,7 @@ pub fn announcement_event(
         Tag::custom(
             TagKind::custom("description"),
             [format!(
-                "BTC price in whole {unit}, median of several exchanges, attested at \
+                "BTC price in whole {unit}, median of several sources, attested at \
                  maturity {maturity} (unix). Event id {}.",
                 ann.oracle_event.event_id
             )],

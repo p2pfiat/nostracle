@@ -13,7 +13,8 @@ rebroadcast_secs = 21600        # re-send recent events every 6h
 pairs = ["USD", "EUR"]
 
 num_digits    = 20              # max attestable price 1_048_575
-min_sources   = 3
+min_sources   = 5               # quotes needed: 4 exchanges + Delphi + PriceStr = 6
+min_agreeing  = 3               # of those, within max_deviation of the median
 max_deviation = 0.01            # 1%
 max_attest_delay_secs = 3600    # later than this: event is MISSED, contracts refund
 archive_after_secs    = 604800  # move finished events to events.archive.jsonl after 7 days
@@ -27,6 +28,12 @@ horizon_secs  = 172800
 [[series]]                      # contract maturities: daily 00:00 UTC, 90 days ahead
 interval_secs = 86400
 horizon_secs  = 7776000
+
+# Extra price feeds read from nostr. They count as normal quotes in the median.
+# [nostr_feeds]
+# enabled = true
+# delphi_max_age_secs   = 10800
+# pricestr_max_age_secs = 120
 
 [profile]
 name  = "nostracle"

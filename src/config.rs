@@ -27,9 +27,12 @@ pub struct Config {
     /// Binary digits of the attested price (20 -> max 1_048_575).
     #[serde(default = "d_digits")]
     pub num_digits: u16,
-    /// Quotes that must agree before attesting.
+    /// Quotes needed in total (exchanges plus nostr feeds) before attesting.
     #[serde(default = "d_min_sources")]
     pub min_sources: usize,
+    /// Of those, how many must lie within `max_deviation` of the median.
+    #[serde(default = "d_min_agreeing")]
+    pub min_agreeing: usize,
     /// Allowed relative deviation from the median (0.01 = 1%).
     #[serde(default = "d_max_dev")]
     pub max_deviation: f64,
@@ -47,6 +50,37 @@ pub struct Config {
     pub profile: Profile,
     /// Paid attestations over zaps. Without this section attestations are public.
     pub pricing: Option<Pricing>,
+    /// Price feeds read from nostr, used as extra quotes in the median.
+    #[serde(default)]
+    pub nostr_feeds: NostrFeeds,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NostrFeeds {
+    pub enabled: bool,
+    pub delphi_pubkey: String,
+    pub delphi_relay: String,
+    /// Ignore Delphi audits older than this.
+    pub delphi_max_age_secs: u64,
+    pub pricestr_pubkey: String,
+    pub pricestr_relays: Vec<String>,
+    /// Ignore PriceStr readings older than this.
+    pub pricestr_max_age_secs: u64,
+}
+
+impl Default for NostrFeeds {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delphi_pubkey: "bc94c9ed60c870e0b826bd4adf839f667404d5a5e3d852c2e0ff05c7609e9be0".into(),
+            delphi_relay: "wss://rof.illuminodes.com".into(),
+            delphi_max_age_secs: 3 * 3600,
+            pricestr_pubkey: "c6326ba648f2645f419a63e03c525b3547688a3aadab82c9678c18258eb71239".into(),
+            pricestr_relays: vec!["wss://relay.damus.io".into(), "wss://relay.primal.net".into()],
+            pricestr_max_age_secs: 120,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +148,9 @@ fn d_digits() -> u16 {
     20
 }
 fn d_min_sources() -> usize {
+    5
+}
+fn d_min_agreeing() -> usize {
     3
 }
 fn d_max_dev() -> f64 {
@@ -150,7 +187,17 @@ impl Config {
             anyhow::ensure!(s.horizon_secs >= s.interval_secs, "series horizon < interval");
         }
         anyhow::ensure!(self.num_digits > 0 && self.num_digits <= 32, "num_digits out of range");
-        anyhow::ensure!(self.min_sources >= 1, "min_sources must be >= 1");
+        anyhow::ensure!(self.min_agreeing >= 1, "min_agreeing must be >= 1");
+        anyhow::ensure!(
+            self.min_agreeing <= self.min_sources,
+            "min_agreeing cannot exceed min_sources"
+        );
+        let available = crate::price::ALL_SOURCES.len() + if self.nostr_feeds.enabled { 2 } else { 0 };
+        anyhow::ensure!(
+            self.min_sources <= available,
+            "min_sources ({}) exceeds the {available} available feeds",
+            self.min_sources
+        );
         anyhow::ensure!(self.min_relay_acks >= 1, "min_relay_acks must be >= 1");
         anyhow::ensure!(
             self.min_relay_acks <= self.relays.len(),
