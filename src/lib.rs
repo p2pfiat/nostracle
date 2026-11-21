@@ -4,3 +4,4 @@ pub mod nip88;
 pub mod oracle;
 pub mod price;
 pub mod storage;
+pub mod zaps;

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nostr_sdk::prelude::*;
+use nostracle::zaps::{self, BuyerMessage};
 use nostracle::{config::Config, nip88, oracle, price, storage::FileStorage};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,6 +43,28 @@ enum Cmd {
         /// Only events created in the last N seconds.
         #[arg(long, default_value_t = 86400)]
         since_secs: u64,
+    },
+    /// Buy an attestation or custom event from an oracle with a zap.
+    /// Prints a Lightning invoice to pay, then waits for the delivery.
+    Buy {
+        /// Oracle pubkey (hex or npub).
+        #[arg(long)]
+        oracle: String,
+        /// Event to buy, e.g. btcusd-1798000000.
+        #[arg(long, conflicts_with = "custom", required_unless_present = "custom")]
+        event_id: Option<String>,
+        /// Custom event, as `USD:1798000000`.
+        #[arg(long)]
+        custom: Option<String>,
+        /// Amount to pay, as stated in the oracle's profile.
+        #[arg(long)]
+        sats: u64,
+        /// Buyer key file (hex); created if missing. Keep it to receive the delivery.
+        #[arg(long, default_value = "data/buyer.key")]
+        key_file: PathBuf,
+        /// Stop waiting after this many seconds.
+        #[arg(long, default_value_t = 900)]
+        timeout_secs: u64,
     },
     /// Skip the nonce counter ahead. REQUIRED after restoring an older db backup.
     BumpNonces {
@@ -119,6 +142,13 @@ async fn main() -> Result<()> {
             };
             std::process::exit(verify(&cfg, pk, since_secs).await?);
         }
+        Cmd::Buy { oracle: o, event_id, custom, sats, key_file, timeout_secs } => {
+            let oracle_pk = PublicKey::parse(&o)?;
+            let keys = buyer_keys(&key_file)?;
+            std::process::exit(
+                buy(&cfg, keys, oracle_pk, event_id, custom, sats, timeout_secs).await?,
+            );
+        }
         Cmd::BumpNonces { by } => {
             let st = FileStorage::open(&cfg.db_file)?;
             println!("next nonce index now {}", st.bump_nonces(by)?);
@@ -130,6 +160,128 @@ async fn main() -> Result<()> {
 fn own_keys(cfg: &Config) -> Result<Keys> {
     let key = oracle::load_key(&cfg.key_file)?;
     Ok(Keys::new(SecretKey::from_slice(&key.secret_bytes())?))
+}
+
+fn buyer_keys(path: &std::path::Path) -> Result<Keys> {
+    if path.exists() {
+        return Ok(Keys::parse(std::fs::read_to_string(path)?.trim())?);
+    }
+    let keys = Keys::generate();
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(path, keys.secret_key().to_secret_hex())?;
+    println!("created buyer key {path:?}");
+    Ok(keys)
+}
+
+/// Zap flow for buyers. Returns the process exit code.
+async fn buy(
+    cfg: &Config,
+    keys: Keys,
+    oracle_pk: PublicKey,
+    event_id: Option<String>,
+    custom: Option<String>,
+    sats: u64,
+    timeout_secs: u64,
+) -> Result<i32> {
+    let client = Client::new(keys.clone());
+    for r in &cfg.relays {
+        client.add_relay(r.as_str()).await?;
+    }
+    client.connect().await;
+    client.wait_for_connection(Duration::from_secs(10)).await;
+
+    let metadata = client
+        .fetch_metadata(oracle_pk, Duration::from_secs(15))
+        .await?
+        .context("oracle has no profile")?;
+    let lud16 = metadata.lud16.context("oracle profile has no Lightning address")?;
+    let http = reqwest::Client::new();
+    let pay = zaps::resolve_lud16(&http, &lud16).await?;
+    let msat = sats.checked_mul(1000).context("amount too large")?;
+    anyhow::ensure!(
+        msat >= pay.min_sendable && msat <= pay.max_sendable,
+        "amount outside what {lud16} accepts"
+    );
+
+    let mut tags = vec![
+        Tag::public_key(oracle_pk),
+        Tag::custom(TagKind::custom("amount"), [msat.to_string()]),
+        Tag::custom(TagKind::custom("relays"), cfg.relays.iter().cloned()),
+    ];
+    let (wanted, comment) = match (event_id, custom) {
+        (Some(id), _) => {
+            let filter = Filter::new()
+                .author(oracle_pk)
+                .kind(Kind::Custom(nip88::KIND_ANNOUNCEMENT));
+            let anns = client.fetch_events(filter, Duration::from_secs(20)).await?;
+            let ann = anns
+                .iter()
+                .find(|e| {
+                    nip88::verify_announcement(e)
+                        .map(|a| a.oracle_event.event_id == id)
+                        .unwrap_or(false)
+                })
+                .with_context(|| format!("no valid announcement for {id}"))?;
+            tags.push(Tag::event(ann.id));
+            (id, String::new())
+        }
+        (None, Some(c)) => {
+            let (pair, maturity) = c.split_once(':').context("--custom must be PAIR:MATURITY")?;
+            let comment = format!("custom {pair} {maturity}");
+            let (fiat, m) = zaps::parse_custom(&comment).context("invalid --custom")?;
+            (oracle::event_id(fiat, m as u64), comment)
+        }
+        _ => bail!("give --event-id or --custom"),
+    };
+    let request = EventBuilder::new(Kind::ZapRequest, comment).tags(tags).sign_with_keys(&keys)?;
+    let invoice: serde_json::Value = http
+        .get(&pay.callback)
+        .query(&[("amount", msat.to_string()), ("nostr", request.as_json())])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let pr = invoice["pr"].as_str().context("LNURL callback returned no invoice")?;
+    println!("Pay this invoice ({sats} sats):\n\n{pr}\n\nWaiting for delivery of {wanted}...");
+
+    let deadline = oracle::now() + timeout_secs;
+    // NIP-59 randomises gift wrap timestamps up to two days into the past.
+    let since = Timestamp::from(oracle::now().saturating_sub(3 * 86400));
+    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(keys.public_key()).since(since);
+    while oracle::now() < deadline {
+        for wrap in client.fetch_events(filter.clone(), Duration::from_secs(10)).await?.iter() {
+            let Ok(gift) = client.unwrap_gift_wrap(wrap).await else { continue };
+            if gift.sender != oracle_pk {
+                continue;
+            }
+            let Ok(msg) = serde_json::from_str::<BuyerMessage>(&gift.rumor.content) else { continue };
+            match msg {
+                BuyerMessage::Attestation { event_id, announcement_id, attestation } if event_id == wanted => {
+                    let att = Event::from_json(&attestation)?;
+                    let ann_id = EventId::from_hex(&announcement_id)?;
+                    let anns = client
+                        .fetch_events(Filter::new().id(ann_id), Duration::from_secs(15))
+                        .await?;
+                    let ann_ev = anns.first().context("announcement not found on relays")?;
+                    let ann = nip88::verify_announcement(ann_ev)?;
+                    anyhow::ensure!(ann.oracle_public_key.serialize() == oracle_pk.to_bytes(), "wrong oracle key");
+                    let (_, value) = nip88::verify_attestation(&att, ann_ev, &ann)?;
+                    println!("verified attestation {event_id} = {value}\n{attestation}");
+                    return Ok(0);
+                }
+                BuyerMessage::Error { payment_hash, message } => {
+                    println!("oracle message for payment {payment_hash}: {message}");
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    println!("timed out; the delivery stays on the relays, so run again with the same key file");
+    Ok(1)
 }
 
 /// Returns the process exit code: 0 if everything verified.

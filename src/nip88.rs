@@ -33,7 +33,7 @@ fn n_tags(unit: &str) -> [Tag; 2] {
     ]
 }
 
-fn tag_values<'a>(ev: &'a Event, name: &str) -> Vec<&'a [String]> {
+pub(crate) fn tag_values<'a>(ev: &'a Event, name: &str) -> Vec<&'a [String]> {
     ev.tags
         .iter()
         .map(|t| t.as_slice())
