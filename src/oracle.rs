@@ -1,5 +1,5 @@
 //! The oracle service: announce upcoming price events, attest at maturity,
-//! publish both to nostr (NIP-88 kinds 88 / 89), rebroadcast, archive.
+//! publish both to nostr (draft DLC oracle NIP, kinds 88 / 89), rebroadcast, archive.
 
 use crate::config::Config;
 use crate::nip88;
@@ -154,7 +154,7 @@ impl Service {
         };
         let about = p.about.clone().unwrap_or_else(|| {
             format!(
-                "DLC price oracle (NIP-88 kinds 88/89). Pairs: {}. Series: {}. Event id \
+                "DLC price oracle (draft DLC oracle NIP, kinds 88/89). Pairs: {}. Series: {}. Event id \
                  <pair>-<unix maturity>, {} binary digits, unit = whole fiat units. Median of \
                  Kraken, Bitstamp, Coinbase, Bitfinex. {pricing}",
                 pairs.join(", "),

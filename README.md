@@ -12,15 +12,18 @@ Services that use a nostracle can zap it, which pays the oracle and builds its c
 nostracle is a **DLC price oracle** for BTC/USD and BTC/EUR that publishes on nostr
 using the DLC oracle NIP draft ([#1681](https://github.com/nostr-protocol/nips/pull/1681),
 continued in [#2394](https://github.com/nostr-protocol/nips/pull/2394)). The draft has no
-final kind numbers yet; nostracle uses 88/89, as kormir and ddk do.
+final NIP or kind numbers yet; nostracle uses kinds 88/89, as kormir and ddk do. These
+kinds are unrelated to the merged NIP-88 (Polls), which uses kinds 1018 and 1068.
 
 | nostr kind | content | tags |
 |---|---|---|
 | 0  | profile: pairs, schedule, encoding, `lud16` for zaps | |
-| 88 | **announcement**: base64 dlcspecs `oracle_announcement` (oracle key + one nonce per digit) | `relays`, `title`, `description`, `n`=BTC, `n`=USD/EUR |
-| 89 | **attestation**: base64 dlcspecs `oracle_attestation` (one signature per binary digit) | `e`=announcement event id, `n`, `n` |
+| 88 | **announcement**: base64 of kormir's `oracle_announcement` bytes (oracle key + one nonce per digit) | `relays`, `title`, `description`, `n`=BTC, `n`=USD/EUR |
+| 89 | **attestation**: base64 of kormir's `oracle_attestation` bytes (one signature per binary digit) | `e`=announcement event id, `n`, `n` |
 
-Content bytes are identical to kormir's, so kormir/ddk based DLC wallets can use it.
+Content bytes are identical to kormir's, so kormir/ddk based DLC wallets can use it. This layout
+differs from the dlcspecs text: it has no top-level type prefix, and attestations have a `u16`
+outcome count before the outcomes ([discussion](https://github.com/nostr-protocol/nips/pull/2394#issuecomment-7063097193)).
 Clients must verify against the oracle key **inside** the DLC payload (draft rule);
 `nostracle verify` does exactly the checks a client should do.
 
@@ -139,7 +142,7 @@ cargo build
 
 ## Built on
 
-- [kormir](https://crates.io/crates/kormir): DLC oracle primitives and NIP-88 event encoding
+- [kormir](https://crates.io/crates/kormir): DLC oracle primitives and event encoding (kinds 88/89)
 - [nostr-sdk](https://crates.io/crates/nostr-sdk)
 
 ## Roadmap
