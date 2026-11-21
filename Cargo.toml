@@ -2,7 +2,7 @@
 name = "nostracle"
 version = "0.1.0"
 edition = "2021"
-description = "DLC price oracle publishing NIP-88 announcements and attestations on nostr"
+description = "DLC price oracle publishing DLC announcements and attestations on nostr (kinds 88/89)"
 license = "MIT"
 repository = "https://github.com/p2pfiat/nostracle"
 

@@ -1,11 +1,14 @@
-//! NIP-88 style DLC oracle events (draft: nostr-protocol/nips#1681, successor #2394).
+//! DLC oracle events, kinds 88/89 (draft: nostr-protocol/nips#1681, successor #2394).
+//! Unrelated to the merged NIP-88 (Polls); the module name is historical.
 //!
-//! - announcement, kind 88: content = base64(dlcspecs `oracle_announcement`),
+//! - announcement, kind 88: content = base64(kormir `oracle_announcement` bytes),
 //!   tags `relays`, `title`, `description`, two `n` tags (base, quote)
-//! - attestation, kind 89: content = base64(dlcspecs `oracle_attestation`),
+//! - attestation, kind 89: content = base64(kormir `oracle_attestation` bytes),
 //!   tag `e` = nostr id of the announcement event, two `n` tags
 //!
 //! Content bytes are the same as kormir's, so kormir-based clients keep working.
+//! They differ from the dlcspecs text: no top-level type prefix, and attestations
+//! have a `u16` outcome count before the outcomes.
 //! Per the draft, clients must validate against the oracle key *inside* the
 //! DLC payload, not the nostr event key; `verify_*` below do exactly that.
 

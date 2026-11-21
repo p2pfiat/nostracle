@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(version, about = "DLC price oracle on nostr (NIP-88)")]
+#[command(version, about = "DLC price oracle on nostr (draft DLC oracle NIP, kinds 88/89)")]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
