@@ -32,7 +32,7 @@ use it.
 
 - id: `<pair>-<unix maturity>`, e.g. `btcusd-1795190820`
 - default schedules (`[[series]]`): **hourly, announced 2 days ahead** and
-  **daily at 00:00 UTC, announced 90 days ahead** (for 30–90 day contracts).
+  **daily at 00:00 UTC, announced 90 days ahead** (for 30â€“90 day contracts).
   A maturity shared by both is one event.
 - numeric, base 2, `num_digits` digits (default 20, max 1 048 575), unsigned
 - unit `USD` / `EUR`, precision 0 (whole fiat units)
@@ -57,10 +57,50 @@ cargo run -- verify --since-secs 3600 # fetch own events from relays, verify lik
 ### Publishing
 
 - An event counts as published once `min_relay_acks` relays accepted it; until
-  then it is retried every tick. Events maturing within ±2 days are re-sent to
+  then it is retried every tick. Events maturing within Â±2 days are re-sent to
   all relays every `rebroadcast_secs`.
 - Sends are paced (1 per second, 20 per tick): relay.damus.io bans clients that
   burst. A fresh start (~280 announcements) is fully published after ~7 minutes.
+
+## Paid attestations (zaps)
+
+With a `[pricing]` section, announcements stay public and free, and attestations
+are sold. There is no node integration: the oracle only needs a Lightning address
+(`profile.lud16`) on a provider that supports zaps (NIP-57).
+
+| To buy | Zap | Comment |
+|---|---|---|
+| **One attestation** | the kind-88 announcement, at least `attestation_sats` | |
+| **A custom event** (any maturity, attestation included) | the oracle's profile, at least `custom_event_sats` | `custom <USD\|EUR> <unix maturity>` |
+
+A profile zap without such a comment is a tip.
+
+1. The buyer's wallet signs a zap request and pays the invoice.
+2. The Lightning address provider publishes a zap receipt (kind 9735).
+3. The oracle checks the receipt: signed by its provider, invoice bound to the zap
+   request by its description hash, amount matching, each payment hash counted once.
+4. At maturity, the signed kind-89 event goes to the buyer in a **NIP-17 private
+   message**. It is not published, unless `public_attestation_delay_secs` is set.
+
+Messages to buyers are JSON with `type` = `paid`, `attestation` or `error`.
+The zap request's `relays` tag must include relays the oracle reads.
+
+```sh
+cargo run -- buy --oracle <npub> --event-id btcusd-1798000000 --sats 100
+cargo run -- buy --oracle <npub> --custom USD:1798000000 --sats 1000
+```
+
+`buy` prints the invoice to pay, waits for the delivery and verifies it.
+
+Know the limits:
+
+- **Refunds are manual.** Underpaid zaps and paid events that were missed are listed
+  under `refunds_to_review` in `status`.
+- **Zap receipts are public.** Anyone can see which pubkey bought which event, so
+  buyers who care should use a throwaway key.
+- **The provider is trusted** to publish honest receipts.
+- **A buyer can share the attestation** after receiving it.
+- If nobody buys an attestation, it is never released and contracts refund.
 
 ## Operating it
 
@@ -106,7 +146,8 @@ cargo build
 
 - [x] Long-dated daily series, relay quorum + rebroadcast, client-side verification, ops tooling
 - [ ] Encrypted key file / remote signer
-- [ ] Zap receipts (NIP-57) â†’ public "who pays this oracle" stats
+- [x] Paid attestations and custom events over zaps (NIP-57, NIP-17)
+- [ ] Test with a real Lightning address and wallet
 - [ ] Optional HTTP API compatible with kormir/ddk oracle clients
 - [ ] More pairs, configurable sources, signed source quotes in a kind-30078 tick event
 - [ ] k-of-n deployment guide (several independent nostracles)

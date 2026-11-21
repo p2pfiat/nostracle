@@ -45,6 +45,27 @@ pub struct Config {
     pub tick_secs: u64,
     #[serde(default)]
     pub profile: Profile,
+    /// Paid attestations over zaps. Without this section attestations are public.
+    pub pricing: Option<Pricing>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pricing {
+    /// Zap on an announcement that buys its attestation.
+    pub attestation_sats: u64,
+    /// Zap that creates a custom event; includes its attestation.
+    pub custom_event_sats: u64,
+    /// Custom maturities must be at least this far ahead.
+    #[serde(default = "d_custom_lead")]
+    pub custom_min_lead_secs: u64,
+    /// Custom maturities can be at most this far ahead.
+    #[serde(default = "d_custom_horizon")]
+    pub custom_max_horizon_secs: u64,
+    /// Publish attestations for everyone this long after maturity. Unset: never.
+    pub public_attestation_delay_secs: Option<u64>,
+    /// Key that signs zap receipts. Unset: looked up from `profile.lud16`.
+    pub zapper_pubkey: Option<String>,
 }
 
 /// A schedule of events: one per `interval_secs` (aligned to unix time, so
@@ -104,6 +125,12 @@ fn d_max_delay() -> u64 {
 fn d_archive_after() -> u64 {
     7 * 86400
 }
+fn d_custom_lead() -> u64 {
+    600
+}
+fn d_custom_horizon() -> u64 {
+    365 * 86400
+}
 fn d_tick() -> u64 {
     30
 }
@@ -135,6 +162,16 @@ impl Config {
             self.archive_after_secs > self.max_attest_delay_secs,
             "archive_after_secs must exceed max_attest_delay_secs"
         );
+        if let Some(p) = &self.pricing {
+            anyhow::ensure!(
+                p.attestation_sats > 0 && p.custom_event_sats > 0,
+                "prices must be > 0"
+            );
+            anyhow::ensure!(
+                p.zapper_pubkey.is_some() || self.profile.lud16.is_some(),
+                "[pricing] needs profile.lud16 (or zapper_pubkey) to receive zaps"
+            );
+        }
         Ok(())
     }
 }

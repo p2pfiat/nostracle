@@ -32,3 +32,12 @@ horizon_secs  = 7776000
 name  = "nostracle"
 # lud16 = "you@your-lightning-address.com"   # receive zaps
 # website = "https://github.com/p2pfiat/nostracle"
+
+# Paid attestations over zaps. Needs lud16 above, on a provider that supports zaps.
+# Remove this section to publish all attestations for free.
+# [pricing]
+# attestation_sats  = 100       # zap on an announcement buys its attestation
+# custom_event_sats = 1000      # zap on the profile creates a custom event
+# custom_min_lead_secs    = 600
+# custom_max_horizon_secs = 31536000
+# public_attestation_delay_secs = 86400   # optional: free for everyone after a delay

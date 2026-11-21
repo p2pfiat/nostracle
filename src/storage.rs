@@ -31,6 +31,31 @@ pub struct NostrRecord {
     pub last_broadcast: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentStatus {
+    /// Paid; attestation still to be delivered.
+    Pending,
+    Delivered,
+    /// A donation, nothing owed.
+    Tip,
+    /// Not accepted (e.g. underpaid). The operator may want to refund it.
+    Rejected(String),
+    /// Accepted, but the attestation can never be delivered. Refund it.
+    Failed(String),
+}
+
+/// One zap, keyed by payment hash so that a receipt is only ever counted once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Payment {
+    pub payment_hash: String,
+    pub buyer: String,
+    pub event_id: Option<String>,
+    pub sats: u64,
+    pub created_at: u64,
+    pub status: PaymentStatus,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
     next_nonce_index: u32,
@@ -40,6 +65,8 @@ struct State {
     /// Events that reached `max_attest_delay` without a reliable price.
     #[serde(default)]
     missed: BTreeSet<String>,
+    #[serde(default)]
+    payments: BTreeMap<String, Payment>,
 }
 
 pub struct FileStorage {
@@ -128,6 +155,30 @@ impl FileStorage {
         self.state.lock().unwrap().missed.iter().cloned().collect()
     }
 
+    pub fn has_payment(&self, payment_hash: &str) -> bool {
+        self.state.lock().unwrap().payments.contains_key(payment_hash)
+    }
+
+    pub fn insert_payment(&self, payment: Payment) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.payments.entry(payment.payment_hash.clone()).or_insert(payment);
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub fn payments(&self) -> Vec<Payment> {
+        self.state.lock().unwrap().payments.values().cloned().collect()
+    }
+
+    pub fn set_payment_status(&self, payment_hash: &str, status: PaymentStatus) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let p = st
+            .payments
+            .get_mut(payment_hash)
+            .ok_or_else(|| anyhow::anyhow!("unknown payment {payment_hash}"))?;
+        p.status = status;
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     /// Skip the nonce counter ahead. Run after restoring an older backup so
     /// that nonces handed out after the backup are never reused.
     pub fn bump_nonces(&self, by: u32) -> Result<u32> {
@@ -141,6 +192,35 @@ impl FileStorage {
         Ok(st.next_nonce_index)
     }
 
+    /// Move finished payments older than `cutoff` to the archive file.
+    /// `cutoff` must be older than the zap receipt scan window, or a replayed
+    /// receipt could be counted again.
+    pub fn archive_payments_before(&self, cutoff: u64) -> Result<usize> {
+        let mut st = self.state.lock().unwrap();
+        let old: Vec<String> = st
+            .payments
+            .values()
+            .filter(|p| p.created_at < cutoff && p.status != PaymentStatus::Pending)
+            .map(|p| p.payment_hash.clone())
+            .collect();
+        if old.is_empty() {
+            return Ok(0);
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.archive_path())?;
+        for id in &old {
+            writeln!(f, "{}", serde_json::json!({ "payment": st.payments.get(id) }))?;
+        }
+        f.sync_all()?;
+        for id in &old {
+            st.payments.remove(id);
+        }
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(old.len())
+    }
+
     /// Move events with maturity before `cutoff` to the archive file.
     /// Returns how many were archived.
     pub fn archive_before(&self, cutoff: u64) -> Result<usize> {
@@ -149,6 +229,13 @@ impl FileStorage {
             .events
             .values()
             .filter(|e| maturity(e) < cutoff)
+            // keep events a buyer is still waiting for
+            .filter(|e| {
+                !st.payments.values().any(|p| {
+                    p.status == PaymentStatus::Pending
+                        && p.event_id.as_deref() == Some(e.event_id.as_str())
+                })
+            })
             .map(|e| e.event_id.clone())
             .collect();
         if old.is_empty() {

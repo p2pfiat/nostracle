@@ -4,11 +4,13 @@
 use crate::config::Config;
 use crate::nip88;
 use crate::price::{self, Fiat};
-use crate::storage::{maturity, FileStorage};
+use crate::storage::{maturity, FileStorage, Payment, PaymentStatus};
+use crate::zaps::{self, BuyerMessage, VerifiedZap, ZapTarget};
 use anyhow::{anyhow, Context, Result};
 use kormir::storage::Storage;
 use kormir::{EventDescriptor, Oracle};
 use nostr_sdk::prelude::*;
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +23,10 @@ const SEND_SPACING: Duration = Duration::from_millis(1000);
 /// Periodically rebroadcast events whose maturity is within this window of now.
 /// Far-future announcements are only re-sent while under the relay quorum.
 const REBROADCAST_WINDOW: u64 = 2 * 86400;
+/// How far back zap receipts are read after a restart.
+const ZAP_SCAN_WINDOW: u64 = 7 * 86400;
+/// Payment records outlive the scan window, so a replayed receipt is recognised.
+const PAYMENT_RETENTION: u64 = 30 * 86400;
 
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
@@ -72,6 +78,17 @@ pub struct Service {
     pub oracle: Oracle<FileStorage>,
     http: reqwest::Client,
     nostr: Option<Client>,
+    /// Key of our Lightning address provider, which signs zap receipts.
+    zapper: Option<PublicKey>,
+    last_zap_scan: Cell<u64>,
+}
+
+/// May this event's attestation be published for everyone at time `t`?
+pub fn attestation_is_public(cfg: &Config, maturity: u64, t: u64) -> bool {
+    match &cfg.pricing {
+        None => true,
+        Some(p) => p.public_attestation_delay_secs.is_some_and(|d| t >= maturity + d),
+    }
 }
 
 impl Service {
@@ -101,7 +118,19 @@ impl Service {
         } else {
             None
         };
-        Ok(Self { cfg, oracle, http, nostr })
+        let zapper = match (&cfg.pricing, publish) {
+            (Some(p), true) => Some(match &p.zapper_pubkey {
+                Some(k) => PublicKey::parse(k).context("pricing.zapper_pubkey")?,
+                None => {
+                    let addr = cfg.profile.lud16.as_deref().unwrap_or_default();
+                    zaps::resolve_zapper(&http, addr)
+                        .await
+                        .with_context(|| format!("look up zap provider of {addr}"))?
+                }
+            }),
+            _ => None,
+        };
+        Ok(Self { cfg, oracle, http, nostr, zapper, last_zap_scan: Cell::new(0) })
     }
 
     pub async fn publish_profile(&self) -> Result<()> {
@@ -114,11 +143,20 @@ impl Service {
             .iter()
             .map(|s| format!("every {}s, {}s ahead", s.interval_secs, s.horizon_secs))
             .collect();
+        let pricing = match &self.cfg.pricing {
+            None => "Attestations are public.".to_string(),
+            Some(x) => format!(
+                "Zap an announcement {} sats to receive its attestation by private message. \
+                 Zap this profile {} sats with comment `custom <USD|EUR> <unix maturity>` for a \
+                 custom event.",
+                x.attestation_sats, x.custom_event_sats
+            ),
+        };
         let about = p.about.clone().unwrap_or_else(|| {
             format!(
                 "DLC price oracle (NIP-88 kinds 88/89). Pairs: {}. Series: {}. Event id \
                  <pair>-<unix maturity>, {} binary digits, unit = whole fiat units. Median of \
-                 Kraken, Bitstamp, Coinbase, Bitfinex.",
+                 Kraken, Bitstamp, Coinbase, Bitfinex. {pricing}",
                 pairs.join(", "),
                 series.join("; "),
                 self.cfg.num_digits
@@ -144,8 +182,14 @@ impl Service {
     pub async fn tick(&self) -> Result<()> {
         let t = now();
         self.announce(t).await?;
+        // A failing relay or zap scan must never hold up attesting.
+        if let Err(e) = self.process_zaps(t).await {
+            log::warn!("zap scan: {e:#}");
+        }
         self.attest(t).await?;
         self.publish(t).await?;
+        self.deliver().await?;
+        self.oracle.storage.archive_payments_before(t.saturating_sub(PAYMENT_RETENTION))?;
         let n = self
             .oracle
             .storage
@@ -283,7 +327,8 @@ impl Service {
                 && m <= t + REBROADCAST_WINDOW
                 && rec.last_broadcast + self.cfg.rebroadcast_secs <= t;
             let send_ann = rec.announcement_acks < need || rebroadcast;
-            let send_att = att_ev.is_some() && (rec.attestation_acks < need || rebroadcast);
+            let public = attestation_is_public(&self.cfg, m, t);
+            let send_att = public && att_ev.is_some() && (rec.attestation_acks < need || rebroadcast);
             if !send_ann && !send_att {
                 continue;
             }
@@ -312,6 +357,219 @@ impl Service {
         }
         Ok(())
     }
+
+    /// Read new zap receipts and record what they pay for.
+    async fn process_zaps(&self, t: u64) -> Result<()> {
+        let (Some(client), Some(zapper)) = (&self.nostr, self.zapper) else { return Ok(()) };
+        let oracle_pk = self.oracle.nostr_keys().public_key();
+        let last = self.last_zap_scan.get();
+        // Overlap scans: receipts can reach a relay late. Payment hashes dedup.
+        let since = if last == 0 { t.saturating_sub(ZAP_SCAN_WINDOW) } else { last.saturating_sub(3600) };
+        let filter = Filter::new()
+            .kind(Kind::ZapReceipt)
+            .author(zapper)
+            .pubkey(oracle_pk)
+            .since(Timestamp::from(since));
+        let receipts = client.fetch_events(filter, Duration::from_secs(10)).await?;
+        for r in receipts.iter() {
+            match zaps::verify_receipt(r, &zapper, &oracle_pk) {
+                Ok(zap) if self.oracle.storage.has_payment(&zap.payment_hash) => {}
+                Ok(zap) => self.handle_zap(zap, t).await?,
+                Err(e) => log::warn!("ignoring zap receipt {}: {e:#}", r.id),
+            }
+        }
+        self.last_zap_scan.set(t);
+        Ok(())
+    }
+
+    async fn handle_zap(&self, zap: VerifiedZap, t: u64) -> Result<()> {
+        let Some(pricing) = self.cfg.pricing.clone() else { return Ok(()) };
+        let st = &self.oracle.storage;
+        let outcome: Result<String, String> = match zap.target {
+            ZapTarget::Tip => {
+                log::info!("tip of {} sats", zap.sats);
+                st.insert_payment(payment(&zap, None, t, PaymentStatus::Tip))?;
+                return Ok(());
+            }
+            ZapTarget::Announcement(id) => {
+                let found = st.list_events().into_iter().find(|e| {
+                    st.nostr_record(&e.event_id).announcement.is_some_and(|a| a.id == id)
+                });
+                match found {
+                    None => Err("zapped event is not a live announcement".to_string()),
+                    Some(_) if zap.sats < pricing.attestation_sats => Err(format!(
+                        "paid {} sats, an attestation costs {}",
+                        zap.sats, pricing.attestation_sats
+                    )),
+                    Some(e) if st.is_missed(&e.event_id) => {
+                        Err("this event was missed and will never be attested".to_string())
+                    }
+                    Some(e) => Ok(e.event_id),
+                }
+            }
+            ZapTarget::Custom { fiat, maturity } => {
+                let m = maturity as u64;
+                if zap.sats < pricing.custom_event_sats {
+                    Err(format!(
+                        "paid {} sats, a custom event costs {}",
+                        zap.sats, pricing.custom_event_sats
+                    ))
+                } else if !self.cfg.pairs.contains(&fiat) {
+                    Err(format!("pair {} is not offered", fiat.code()))
+                } else if m < t + pricing.custom_min_lead_secs
+                    || m > t + pricing.custom_max_horizon_secs
+                {
+                    Err(format!(
+                        "maturity must be {}s to {}s from now",
+                        pricing.custom_min_lead_secs, pricing.custom_max_horizon_secs
+                    ))
+                } else {
+                    let id = event_id(fiat, m);
+                    self.ensure_custom_event(&id, fiat, maturity).await?;
+                    Ok(id)
+                }
+            }
+        };
+        let buyer_msg = match outcome {
+            Ok(id) => {
+                st.insert_payment(payment(&zap, Some(id.clone()), t, PaymentStatus::Pending))?;
+                let ev = st.list_events().into_iter().find(|e| e.event_id == id);
+                let ann = st.nostr_record(&id).announcement;
+                log::info!("paid: {id}, {} sats", zap.sats);
+                match (ev, ann) {
+                    (Some(ev), Some(ann)) => BuyerMessage::Paid {
+                        event_id: id,
+                        announcement_id: ann.id.to_hex(),
+                        maturity: maturity(&ev) as u32,
+                    },
+                    _ => return Ok(()),
+                }
+            }
+            Err(message) => {
+                log::warn!("rejected zap {} ({} sats): {message}", zap.payment_hash, zap.sats);
+                st.insert_payment(payment(&zap, None, t, PaymentStatus::Rejected(message.clone())))?;
+                BuyerMessage::Error { payment_hash: zap.payment_hash.clone(), message }
+            }
+        };
+        // Best effort: the attestation itself is retried until delivered.
+        if let Err(e) = self.send_dm(zap.buyer, &buyer_msg).await {
+            log::warn!("message to buyer: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Create (if needed) a custom event and publish its announcement now.
+    async fn ensure_custom_event(&self, id: &str, fiat: Fiat, maturity: u32) -> Result<()> {
+        let st = &self.oracle.storage;
+        let existing = st.get_event(id.to_string()).await.map_err(|e| anyhow!("{e}"))?;
+        let data = match existing {
+            Some(d) => d,
+            None => {
+                self.oracle
+                    .create_numeric_event(
+                        id.to_string(),
+                        self.cfg.num_digits,
+                        false,
+                        0,
+                        fiat.code().to_string(),
+                        maturity,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("custom event {id}: {e}"))?;
+                st.get_event(id.to_string())
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow!("custom event {id} not stored"))?
+            }
+        };
+        if st.nostr_record(id).announcement.is_none() {
+            let e = nip88::announcement_event(
+                &self.oracle.nostr_keys(),
+                &data.announcement,
+                &self.cfg.relays,
+            )?;
+            st.update_nostr(id, |r| r.announcement = Some(e.clone()))?;
+            if let Some(client) = &self.nostr {
+                let acks = self.send(client, &e).await;
+                st.update_nostr(id, |r| r.announcement_acks = acks)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deliver attestations to everyone who paid for them.
+    async fn deliver(&self) -> Result<()> {
+        if self.nostr.is_none() {
+            return Ok(());
+        }
+        let st = &self.oracle.storage;
+        let keys = self.oracle.nostr_keys();
+        for p in st.payments().into_iter().filter(|p| p.status == PaymentStatus::Pending) {
+            let id = p.event_id.clone().unwrap_or_default();
+            let ev = st.get_event(id.clone()).await.map_err(|e| anyhow!("{e}"))?;
+            let buyer = PublicKey::parse(&p.buyer)?;
+            let Some(ev) = ev else {
+                st.set_payment_status(&p.payment_hash, PaymentStatus::Failed("event not found".into()))?;
+                continue;
+            };
+            if st.is_missed(&id) {
+                let message = "this event was missed and will never be attested".to_string();
+                log::error!("REFUND DUE: {} sats, payment {}: {message}", p.sats, p.payment_hash);
+                let msg = BuyerMessage::Error { payment_hash: p.payment_hash.clone(), message: message.clone() };
+                if self.send_dm(buyer, &msg).await.is_ok() {
+                    st.set_payment_status(&p.payment_hash, PaymentStatus::Failed(message))?;
+                }
+                continue;
+            }
+            let Some(att) = ev.attestation() else { continue };
+            let rec = st.nostr_record(&id);
+            let Some(ann) = rec.announcement else { continue };
+            let att_ev = match rec.attestation {
+                Some(e) => e,
+                None => {
+                    let unit = unit_of(&ev).unwrap_or_default();
+                    let e = nip88::attestation_event(&keys, &att, &unit, ann.id)?;
+                    st.update_nostr(&id, |r| r.attestation = Some(e.clone()))?;
+                    e
+                }
+            };
+            let msg = BuyerMessage::Attestation {
+                event_id: id.clone(),
+                announcement_id: ann.id.to_hex(),
+                attestation: att_ev.as_json(),
+            };
+            match self.send_dm(buyer, &msg).await {
+                Ok(()) => {
+                    st.set_payment_status(&p.payment_hash, PaymentStatus::Delivered)?;
+                    log::info!("delivered attestation {id}");
+                }
+                Err(e) => log::warn!("deliver {id}: {e:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a NIP-17 private message; succeeds once a relay accepted it.
+    async fn send_dm(&self, to: PublicKey, msg: &BuyerMessage) -> Result<()> {
+        let client = self.nostr.as_ref().ok_or_else(|| anyhow!("no relays"))?;
+        let out = client
+            .send_private_msg(to, serde_json::to_string(msg)?, [])
+            .await?;
+        tokio::time::sleep(SEND_SPACING).await;
+        anyhow::ensure!(!out.success.is_empty(), "no relay accepted the message");
+        Ok(())
+    }
+}
+
+fn payment(zap: &VerifiedZap, event_id: Option<String>, t: u64, status: PaymentStatus) -> Payment {
+    Payment {
+        payment_hash: zap.payment_hash.clone(),
+        buyer: zap.buyer.to_hex(),
+        event_id,
+        sats: zap.sats,
+        created_at: t,
+        status,
+    }
 }
 
 /// Health summary for monitoring, computed from the db without the key.
@@ -327,6 +585,10 @@ pub struct Status {
     pub attested_not_published: Vec<String>,
     pub missed: Vec<String>,
     pub latest_announced_maturity: Option<u64>,
+    pub payments_pending: usize,
+    pub deliveries_overdue: Vec<String>,
+    /// Paid, but rejected or undeliverable: consider refunding these.
+    pub refunds_to_review: Vec<String>,
 }
 
 pub fn status(cfg: &Config) -> Result<Status> {
@@ -347,7 +609,27 @@ pub fn status(cfg: &Config) -> Result<Status> {
         attested_not_published: vec![],
         missed: st.missed(),
         latest_announced_maturity: events.iter().map(maturity).max(),
+        payments_pending: 0,
+        deliveries_overdue: vec![],
+        refunds_to_review: vec![],
     };
+    for p in st.payments() {
+        match &p.status {
+            PaymentStatus::Pending => {
+                s.payments_pending += 1;
+                let signed = p.event_id.as_ref().is_some_and(|id| {
+                    events.iter().any(|e| e.event_id == *id && !e.signatures.is_empty())
+                });
+                if signed {
+                    s.deliveries_overdue.push(p.payment_hash.clone());
+                }
+            }
+            PaymentStatus::Rejected(why) | PaymentStatus::Failed(why) => {
+                s.refunds_to_review.push(format!("{} ({} sats): {why}", p.payment_hash, p.sats));
+            }
+            _ => {}
+        }
+    }
     for ev in &events {
         let rec = st.nostr_record(&ev.event_id);
         if rec.announcement_acks < cfg.min_relay_acks {
@@ -358,7 +640,10 @@ pub fn status(cfg: &Config) -> Result<Status> {
         if ev.signatures.is_empty() && t > m + cfg.tick_secs + 60 && !s.missed.contains(&ev.event_id) {
             s.overdue_unattested.push(ev.event_id.clone());
         }
-        if !ev.signatures.is_empty() && rec.attestation_acks < cfg.min_relay_acks {
+        if !ev.signatures.is_empty()
+            && attestation_is_public(cfg, m, t)
+            && rec.attestation_acks < cfg.min_relay_acks
+        {
             s.attested_not_published.push(ev.event_id.clone());
         }
     }
@@ -387,6 +672,9 @@ pub fn status(cfg: &Config) -> Result<Status> {
             "{soon_unpublished} announcements maturing within 24h not yet on {} relays",
             cfg.min_relay_acks
         ));
+    }
+    if !s.deliveries_overdue.is_empty() {
+        s.problems.push(format!("{} paid attestations not delivered", s.deliveries_overdue.len()));
     }
     if !s.missed.is_empty() {
         s.problems.push(format!("{} missed events in the last {}s", s.missed.len(), cfg.archive_after_secs));
