@@ -1,4 +1,4 @@
-//! Spot price collection from several exchanges and robust aggregation.
+//! Spot price collection from exchanges and robust aggregation of all quotes.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -145,8 +145,15 @@ fn median(sorted: &[f64]) -> f64 {
 
 /// Robust aggregate: take the median, drop quotes deviating more than
 /// `max_deviation` (fraction, e.g. 0.01 = 1%) from it, require at least
-/// `min_sources` survivors and return the median of the survivors.
-pub fn aggregate(quotes: &[Quote], min_sources: usize, max_deviation: f64) -> Result<f64> {
+/// `min_agreeing` survivors and return the median of the survivors.
+///
+/// With at least 5 quotes and 3 agreeing, two wrong quotes cannot set the price.
+pub fn aggregate(
+    quotes: &[Quote],
+    min_sources: usize,
+    min_agreeing: usize,
+    max_deviation: f64,
+) -> Result<f64> {
     if quotes.len() < min_sources {
         bail!("only {} quotes, need {min_sources}", quotes.len());
     }
@@ -157,7 +164,7 @@ pub fn aggregate(quotes: &[Quote], min_sources: usize, max_deviation: f64) -> Re
         .into_iter()
         .filter(|p| ((p - m) / m).abs() <= max_deviation)
         .collect();
-    if kept.len() < min_sources {
+    if kept.len() < min_agreeing {
         bail!(
             "only {} of {} quotes within {:.2}% of median {m:.2}: {quotes:?}",
             kept.len(),
@@ -181,16 +188,39 @@ mod tests {
     #[test]
     fn aggregate_drops_outlier() {
         let quotes = [q(100_000.0), q(100_050.0), q(99_980.0), q(120_000.0)];
-        let p = aggregate(&quotes, 3, 0.01).unwrap();
+        let p = aggregate(&quotes, 4, 3, 0.01).unwrap();
         assert_eq!(p, 100_000.0);
     }
 
     #[test]
     fn aggregate_requires_quorum() {
-        assert!(aggregate(&[q(1.0), q(1.0)], 3, 0.01).is_err());
+        assert!(aggregate(&[q(1.0), q(1.0)], 5, 3, 0.01).is_err());
         // two of four agree, two wildly off -> not enough survivors
         let quotes = [q(100.0), q(100.0), q(150.0), q(50.0)];
-        assert!(aggregate(&quotes, 3, 0.01).is_err());
+        assert!(aggregate(&quotes, 4, 3, 0.01).is_err());
+    }
+
+    #[test]
+    fn two_bad_feeds_cannot_set_the_price() {
+        let honest = [q(60_000.0), q(60_100.0), q(59_950.0)];
+        for bad in [[1.0, 1.0], [1e9, 1e9], [1.0, 1e9], [59_000.0, 59_000.0]] {
+            let mut quotes = honest.to_vec();
+            quotes.extend(bad.map(q));
+            let p = aggregate(&quotes, 5, 3, 0.01).unwrap();
+            assert!((59_950.0..=60_100.0).contains(&p), "{bad:?} moved price to {p}");
+        }
+    }
+
+    #[test]
+    fn five_feeds_are_required() {
+        let four = [q(60_000.0), q(60_000.0), q(60_000.0), q(60_000.0)];
+        assert!(aggregate(&four, 5, 3, 0.01).is_err());
+    }
+
+    #[test]
+    fn three_bad_of_five_are_not_accepted_when_they_disagree() {
+        let quotes = [q(60_000.0), q(60_000.0), q(1.0), q(1e9), q(5e8)];
+        assert!(aggregate(&quotes, 5, 3, 0.01).is_err());
     }
 
     #[test]

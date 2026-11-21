@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nostr_sdk::prelude::*;
 use nostracle::zaps::{self, BuyerMessage};
-use nostracle::{config::Config, nip88, oracle, price, storage::FileStorage};
+use nostracle::{config::Config, feeds, nip88, oracle, price, storage::FileStorage};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -97,12 +97,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Price => {
             let http = reqwest::Client::new();
+            let nostr_feeds = feeds::fetch_feeds(&cfg.nostr_feeds, oracle::now()).await;
             for &f in &cfg.pairs {
-                let quotes = price::fetch_quotes(&http, f).await;
+                let quotes = feeds::collect_quotes(&http, f, &nostr_feeds).await;
                 for q in &quotes {
                     println!("{:>9} {} {:>12.2}", q.source, f.code(), q.price);
                 }
-                match price::aggregate(&quotes, cfg.min_sources, cfg.max_deviation) {
+                match price::aggregate(&quotes, cfg.min_sources, cfg.min_agreeing, cfg.max_deviation) {
                     Ok(p) => println!("{:>9} {} {:>12.2}\n", "AGGREGATE", f.code(), p),
                     Err(e) => println!("{:>9} {} unavailable: {e:#}\n", "AGGREGATE", f.code()),
                 }

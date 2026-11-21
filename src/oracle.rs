@@ -2,6 +2,7 @@
 //! publish both to nostr (draft DLC oracle NIP, kinds 88 / 89), rebroadcast, archive.
 
 use crate::config::Config;
+use crate::feeds::{self, Feeds};
 use crate::nip88;
 use crate::price::{self, Fiat};
 use crate::storage::{maturity, FileStorage, Payment, PaymentStatus};
@@ -156,7 +157,7 @@ impl Service {
             format!(
                 "DLC price oracle (draft DLC oracle NIP, kinds 88/89). Pairs: {}. Series: {}. Event id \
                  <pair>-<unix maturity>, {} binary digits, unit = whole fiat units. Median of \
-                 Kraken, Bitstamp, Coinbase, Bitfinex. {pricing}",
+                 Kraken, Bitstamp, Coinbase, Bitfinex, Delphi, PriceStr. {pricing}",
                 pairs.join(", "),
                 series.join("; "),
                 self.cfg.num_digits
@@ -227,6 +228,7 @@ impl Service {
 
     async fn attest(&self, t: u64) -> Result<()> {
         let mut prices: HashMap<String, Option<i64>> = HashMap::new();
+        let mut nostr_feeds: Option<Feeds> = None;
         for ev in self.oracle.storage.list_events() {
             let m = maturity(&ev);
             if !ev.signatures.is_empty() || m > t || self.oracle.storage.is_missed(&ev.event_id) {
@@ -250,8 +252,17 @@ impl Service {
                 }
             };
             if !prices.contains_key(fiat.code()) {
-                let quotes = price::fetch_quotes(&self.http, fiat).await;
-                let p = match price::aggregate(&quotes, self.cfg.min_sources, self.cfg.max_deviation) {
+                if nostr_feeds.is_none() {
+                    nostr_feeds = Some(feeds::fetch_feeds(&self.cfg.nostr_feeds, t).await);
+                }
+                let current = nostr_feeds.as_ref().expect("just fetched");
+                let quotes = feeds::collect_quotes(&self.http, fiat, current).await;
+                let p = match price::aggregate(
+                    &quotes,
+                    self.cfg.min_sources,
+                    self.cfg.min_agreeing,
+                    self.cfg.max_deviation,
+                ) {
                     Ok(p) => Some(p.round() as i64),
                     Err(e) => {
                         log::warn!("no reliable {} price: {e:#}", fiat.code());

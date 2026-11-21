@@ -39,8 +39,14 @@ use it.
   A maturity shared by both is one event.
 - numeric, base 2, `num_digits` digits (default 20, max 1 048 575), unsigned
 - unit `USD` / `EUR`, precision 0 (whole fiat units)
-- price = median of Kraken, Bitstamp, Coinbase and Bitfinex, after dropping quotes more
-  than `max_deviation` from the median; at least `min_sources` must agree
+- price = median of up to six feeds: Kraken, Bitstamp, Coinbase, Bitfinex, plus
+  [Delphi](https://github.com/illuminodes/delphi) (on-chain estimate) and
+  [PriceStr](https://github.com/hexquarter/pricestr) (signed median), both read from nostr.
+  Quotes more than `max_deviation` from the median are dropped.
+- at least `min_sources` (5) feeds must answer and `min_agreeing` (3) must agree, so two
+  wrong feeds cannot set the price. If fewer answer, the event is not attested.
+- Delphi and PriceStr quote USD. For EUR they are converted with PriceStr's published
+  rate, or the rate implied by the exchanges if PriceStr is down
 - if no reliable price is available within `max_attest_delay_secs` after
   maturity, the event is **not** attested and contracts take their refund path
 
