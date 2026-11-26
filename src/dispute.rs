@@ -384,7 +384,69 @@ pub fn parse_dispute_rpc(content: &str) -> Option<DisputeRpcRequest> {
     serde_json::from_value(v).ok()
 }
 
-/// Build a JSON `p2pfiat-rpc-res` reply for a parsed `DisputeRpcRequest`.
+/// Evaluate & sign a Leaf 2 dispute with a persistent 1-signature-per-`vtxo_outpoint` lock.
+///
+/// Security invariants:
+/// - Verifies BOTH User and LP manifest signatures *before* checking/recording the lock
+///   (so an unauthenticated attacker cannot DoS-lock a legitimate contract's outpoint).
+/// - If `vtxo_outpoint` was already signed:
+///   - Idempotently returns the cached `DisputeResponse` if the requested `sighash_hex` matches
+///     (safe against Nostr relay retries / duplicate delivery).
+///   - Rejects any request for a *different* transaction/sighash (eliminates the free-option
+///     / cherry-picking attack across multiple timestamps or spot prices).
+pub fn evaluate_and_sign_dispute_locked(
+    oracle_sk: &SecretKey,
+    req: &DisputeRequest,
+    live_spot_price: f64,
+    min_fee_sats: u64,
+    storage: &crate::storage::FileStorage,
+) -> Result<DisputeResponse> {
+    // 1. Always verify 2-party manifest first so forged requests cannot touch the lock table
+    verify_manifest_signatures(req)?;
+
+    // 2. Check existing single-sign lock for this vtxo_outpoint
+    if let Some(existing) = storage.get_dispute_lock(&req.vtxo_outpoint) {
+        let requested_sh = match req.sighash_hex.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.to_lowercase(),
+            _ => {
+                // Compute BIP-342 sighash from raw_tx_hex so retries without sighash_hex still work idempotently
+                let raw_tx_bytes = hex::decode(req.raw_tx_hex.trim()).context("invalid raw_tx_hex")?;
+                let tx: Transaction = deserialize(&raw_tx_bytes).context("invalid dispute tx")?;
+                let vtxo_pk_bytes = hex::decode(req.vtxo_pk_script_hex.trim())?;
+                let dispute_script_bytes = hex::decode(req.dispute_script_hex.trim())?;
+                let prevout = TxOut {
+                    value: Amount::from_sat(req.total_collateral_sats),
+                    script_pubkey: ScriptBuf::from_bytes(vtxo_pk_bytes),
+                };
+                let dispute_script = ScriptBuf::from_bytes(dispute_script_bytes);
+                let leaf_hash = TapLeafHash::from_script(&dispute_script, LeafVersion::TapScript);
+                let sh = SighashCache::new(&tx)
+                    .taproot_script_spend_signature_hash(
+                        0,
+                        &Prevouts::All(&[prevout]),
+                        leaf_hash,
+                        TapSighashType::Default,
+                    )
+                    .context("compute retry sighash")?;
+                hex::encode(sh.to_byte_array())
+            }
+        };
+        if requested_sh == existing.sighash_hex {
+            return Ok(existing);
+        }
+        bail!(
+            "vtxo_outpoint {} already signed for dispute with sighash {} (single-sign lock prevents cherry-picking)",
+            req.vtxo_outpoint,
+            existing.sighash_hex
+        );
+    }
+
+    // 3. Evaluate, sign, and atomically persist the lock before returning the signature
+    let resp = evaluate_and_sign_dispute(oracle_sk, req, live_spot_price, min_fee_sats)?;
+    storage.record_dispute_lock(&req.vtxo_outpoint, resp)
+}
+
+/// Build a JSON `p2pfiat-rpc-res` reply for a parsed `DisputeRpcRequest` (stateless helper).
 pub fn build_dispute_rpc_reply(
     oracle_sk: &SecretKey,
     rpc: &DisputeRpcRequest,
@@ -392,6 +454,39 @@ pub fn build_dispute_rpc_reply(
     min_fee_sats: u64,
 ) -> String {
     let reply = match evaluate_and_sign_dispute(oracle_sk, &rpc.params, live_spot_price, min_fee_sats) {
+        Ok(res) => DisputeRpcResponse {
+            msg_type: "p2pfiat-rpc-res".into(),
+            req_id: rpc.req_id.clone(),
+            ok: true,
+            result: Some(res),
+            error: None,
+        },
+        Err(e) => DisputeRpcResponse {
+            msg_type: "p2pfiat-rpc-res".into(),
+            req_id: rpc.req_id.clone(),
+            ok: false,
+            result: None,
+            error: Some(format!("{e:#}")),
+        },
+    };
+    serde_json::to_string(&reply).unwrap_or_default()
+}
+
+/// Build a JSON `p2pfiat-rpc-res` reply enforced by the persistent single-sign-per-VTXO lock.
+pub fn build_dispute_rpc_reply_locked(
+    oracle_sk: &SecretKey,
+    rpc: &DisputeRpcRequest,
+    live_spot_price: f64,
+    min_fee_sats: u64,
+    storage: &crate::storage::FileStorage,
+) -> String {
+    let reply = match evaluate_and_sign_dispute_locked(
+        oracle_sk,
+        &rpc.params,
+        live_spot_price,
+        min_fee_sats,
+        storage,
+    ) {
         Ok(res) => DisputeRpcResponse {
             msg_type: "p2pfiat-rpc-res".into(),
             req_id: rpc.req_id.clone(),
@@ -586,5 +681,42 @@ mod tests {
         req.miner_fee_sats = MAX_MINER_FEE_SATS + 1;
         let err = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum allowed"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn enforces_single_sign_per_vtxo_outpoint_lock() {
+        let sk = oracle_sk();
+        let dir = std::env::temp_dir().join(format!(
+            "nostracle-dispute-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("events.json");
+        let storage = crate::storage::FileStorage::open(&db_path).unwrap();
+
+        // 1. Forged manifest request must NOT lock the vtxo_outpoint
+        let mut forged = build_valid_req("short", 3.0, 72_000.0, 600);
+        forged.notional_fiat = 999.0;
+        assert!(evaluate_and_sign_dispute_locked(&sk, &forged, 72_000.0, 100, &storage).is_err());
+        assert!(storage.get_dispute_lock(&forged.vtxo_outpoint).is_none());
+
+        // 2. First valid dispute at $72,000 succeeds and locks the vtxo_outpoint
+        let req1 = build_valid_req("short", 3.0, 72_000.0, 600);
+        let res1 = evaluate_and_sign_dispute_locked(&sk, &req1, 72_000.0, 100, &storage).unwrap();
+
+        // 3. Exact same sighash retry (e.g. Nostr relay redelivery) returns cached signature idempotently
+        let res_retry = evaluate_and_sign_dispute_locked(&sk, &req1, 60_000.0, 100, &storage).unwrap();
+        assert_eq!(res_retry.signature_hex, res1.signature_hex);
+        assert_eq!(res_retry.sighash_hex, res1.sighash_hex);
+
+        // 4. Second dispute for the SAME vtxo_outpoint at a different price ($60,000) is REJECTED
+        let req2 = build_valid_req("short", 3.0, 60_000.0, 600);
+        let err = evaluate_and_sign_dispute_locked(&sk, &req2, 60_000.0, 100, &storage).unwrap_err();
+        assert!(
+            err.to_string().contains("single-sign lock prevents cherry-picking"),
+            "unexpected err: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -127,6 +127,7 @@ Each Nostracle independently (`src/dispute.rs`):
 3. Deserializes the full unsigned Bitcoin transaction (`raw_tx_hex`) and enforces the exact spent VTXO outpoint and contract-bound User/LP payout `scriptPubKey`s (plus optional Watchtower bounty in `output[2]` and bounded L1 `miner_fee_sats` up to 5,000 sats).
 4. Fetches the live median spot price (`BTC/USD` or `BTC/EUR`) and verifies that outputs match the fair pro-rata payout within a **±1% volatility band** with exact collateral conservation.
 5. Independently recomputes the **BIP-342 Tapscript sighash** (`SIGHASH_DEFAULT`, leaf `0xc0`) and signs only that computed digest with its BIP-340 Schnorr key.
+6. Enforces a crash-safe **1-signature-per-`vtxo_outpoint` lock** in `FileStorage`: retries for the exact same `sighash_hex` return the cached signature idempotently, while any attempt to obtain a second signature at a different price/timestamp for the same VTXO is rejected (eliminating free-option cherry-picking).
 
 ## Operating it
 

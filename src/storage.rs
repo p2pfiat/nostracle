@@ -10,6 +10,7 @@
 //! Every mutation rewrites the whole file via write-to-temp + rename. Finished
 //! events are moved to an append-only archive so the live file stays small.
 
+use crate::dispute::DisputeResponse;
 use anyhow::{Context, Result};
 use kormir::error::Error as KError;
 use kormir::storage::{OracleEventData, Storage};
@@ -74,6 +75,10 @@ struct State {
     /// Unix timestamp of the last kind-1 social feed post per fiat unit (e.g. "USD").
     #[serde(default)]
     last_social_post: BTreeMap<String, u64>,
+    /// Persistent 1-signature-per-vtxo_outpoint lock for Leaf 2 on-demand disputes
+    /// (prevents cherry-picking / free-option attacks across multiple timestamps or prices).
+    #[serde(default)]
+    dispute_locks: BTreeMap<String, DisputeResponse>,
 }
 
 pub struct FileStorage {
@@ -154,6 +159,29 @@ impl FileStorage {
         let mut st = self.state.lock().unwrap();
         st.last_social_post.insert(unit.to_string(), t);
         self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Look up any previously signed Leaf 2 dispute response for `vtxo_outpoint`.
+    pub fn get_dispute_lock(&self, vtxo_outpoint: &str) -> Option<DisputeResponse> {
+        let key = vtxo_outpoint.trim().to_lowercase();
+        self.state.lock().unwrap().dispute_locks.get(&key).cloned()
+    }
+
+    /// Atomically record the first signed Leaf 2 dispute response for `vtxo_outpoint`.
+    /// If already locked, refuses to overwrite (returns the existing locked response).
+    pub fn record_dispute_lock(
+        &self,
+        vtxo_outpoint: &str,
+        resp: DisputeResponse,
+    ) -> Result<DisputeResponse> {
+        let key = vtxo_outpoint.trim().to_lowercase();
+        let mut st = self.state.lock().unwrap();
+        if let Some(existing) = st.dispute_locks.get(&key) {
+            return Ok(existing.clone());
+        }
+        st.dispute_locks.insert(key, resp.clone());
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(resp)
     }
 
     pub fn is_missed(&self, event_id: &str) -> bool {

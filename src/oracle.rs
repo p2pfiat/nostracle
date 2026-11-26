@@ -641,10 +641,12 @@ impl Service {
     async fn process_disputes(&self, t: u64) -> Result<()> {
         let Some(client) = &self.nostr else { return Ok(()) };
         let own_pk = self.oracle.nostr_keys().public_key();
+        // NIP-59 randomizes outer kind:1059 `created_at` up to 48 hours into the past
+        // (used by nostr-sdk clients such as ark-watchtower).
         let filter = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(own_pk)
-            .since(Timestamp::from(t.saturating_sub(600)))
+            .since(Timestamp::from(t.saturating_sub(172_800 + 600)))
             .limit(50);
         let events = client
             .fetch_events(filter, Duration::from_secs(4))
@@ -707,11 +709,12 @@ impl Service {
                                 "signing on-demand dispute {} ({cur_code} @ {live_spot:.2})",
                                 rpc.params.contract_id
                             );
-                            dispute::build_dispute_rpc_reply(
+                            dispute::build_dispute_rpc_reply_locked(
                                 &self.oracle_sk,
                                 &rpc,
                                 *live_spot,
                                 min_fee_sats,
+                                &self.oracle.storage,
                             )
                         }
                         Some(Err(err)) => serde_json::to_string(&dispute::DisputeRpcResponse {
