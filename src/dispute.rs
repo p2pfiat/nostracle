@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 
 const DUST_SATS: u64 = 350;
 const PAYOUT_TOLERANCE_SATS: u64 = 1;
+/// Maximum allowed spot price drift (±1%) between the client's tx build time and each
+/// oracle's live tick so a k-of-n quorum can still converge on one tx during volatile crashes
+/// while rejecting any meaningful theft attempt.
+const MAX_SPOT_DRIFT_RATIO: f64 = 0.01;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisputeRequest {
@@ -124,7 +128,7 @@ pub fn evaluate_and_sign_dispute(
         );
     }
 
-    let (expected_user, expected_lp, accrued_fiat) =
+    let (expected_user, _expected_lp, accrued_fiat) =
         compute_dispute_payouts(req, live_spot_price)?;
 
     // 1. Deserialize and validate the Bitcoin transaction structure
@@ -143,16 +147,18 @@ pub fn evaluate_and_sign_dispute(
         tx.output.len()
     );
 
-    // 2. Verify every output amount matches the independently computed fair payout (±1 sat rounding)
+    // 2. Verify output amounts fall within the ±1% volatility band around `live_spot_price`
+    //    and preserve exact collateral conservation (no hidden fee burn or theft).
+    let (user_lo, _, _) = compute_dispute_payouts(req, live_spot_price * (1.0 - MAX_SPOT_DRIFT_RATIO))?;
+    let (user_hi, _, _) = compute_dispute_payouts(req, live_spot_price * (1.0 + MAX_SPOT_DRIFT_RATIO))?;
+    let min_user = user_lo.min(user_hi).saturating_sub(PAYOUT_TOLERANCE_SATS);
+    let max_user = user_lo.max(user_hi).saturating_add(PAYOUT_TOLERANCE_SATS);
+
     let actual_user = tx.output[0].value.to_sat();
     let actual_lp = tx.output[1].value.to_sat();
     ensure!(
-        actual_user.abs_diff(expected_user) <= PAYOUT_TOLERANCE_SATS,
-        "output[0] user payout mismatch: tx has {actual_user} sats, fair payout is {expected_user} sats at spot {live_spot_price:.2}"
-    );
-    ensure!(
-        actual_lp.abs_diff(expected_lp) <= PAYOUT_TOLERANCE_SATS,
-        "output[1] lp payout mismatch: tx has {actual_lp} sats, fair payout is {expected_lp} sats at spot {live_spot_price:.2}"
+        actual_user >= min_user && actual_user <= max_user,
+        "output[0] user payout mismatch: tx has {actual_user} sats, fair band is [{min_user}..={max_user}] (center {expected_user}) at spot {live_spot_price:.2}"
     );
     if req.bounty_sats > 0 {
         let actual_bounty = tx.output[2].value.to_sat();
@@ -163,8 +169,10 @@ pub fn evaluate_and_sign_dispute(
         );
     }
     ensure!(
-        actual_user + actual_lp + req.bounty_sats <= req.total_collateral_sats,
-        "dispute tx outputs exceed total_collateral_sats"
+        actual_user + actual_lp + req.bounty_sats == req.total_collateral_sats,
+        "dispute tx outputs ({}) must exactly equal total_collateral_sats ({})",
+        actual_user + actual_lp + req.bounty_sats,
+        req.total_collateral_sats
     );
 
     // 3. Verify payout scripts (non-empty, and exact match if caller supplied expected scripts)
@@ -421,5 +429,17 @@ mod tests {
         req.sighash_hex = Some("ff".repeat(32));
         let err = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap_err();
         assert!(err.to_string().contains("sighash mismatch"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn accepts_volatile_spot_within_1pct_band_and_rejects_outside() {
+        let sk = test_sk();
+        // Client builds tx at $71,600 (-0.55% from oracle's $72,000 live tick) -> ACCEPTED
+        let req_ok = build_valid_req("short", 3.0, 71_600.0, 600);
+        assert!(evaluate_and_sign_dispute(&sk, &req_ok, 72_000.0, 100).is_ok());
+
+        // Client builds tx at $70,000 (-2.78% from oracle's $72,000 live tick) -> REJECTED
+        let req_bad = build_valid_req("short", 3.0, 70_000.0, 600);
+        assert!(evaluate_and_sign_dispute(&sk, &req_bad, 72_000.0, 100).is_err());
     }
 }
