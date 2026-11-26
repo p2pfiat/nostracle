@@ -2,7 +2,10 @@
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 use nostracle::config::NostrFeeds;
-use nostracle::feeds::{fetch_feeds, read_delphi, read_pricestr, KIND_DELPHI_AUDIT, KIND_PRICESTR};
+use nostracle::feeds::{
+    fetch_feeds, read_delphi, read_orderbook, read_pricestr, KIND_DELPHI_AUDIT,
+    KIND_ORDERBOOK_OFFER, KIND_PRICESTR,
+};
 use nostracle::oracle::now;
 use std::time::Duration;
 
@@ -118,4 +121,105 @@ async fn fetches_both_feeds_from_a_relay() {
     };
     let feeds = fetch_feeds(&down, t).await;
     assert!(feeds.delphi.is_err() && feeds.pricestr.is_err());
+}
+
+fn ob_offer(
+    keys: &Keys,
+    spot: f64,
+    funding_bps: f64,
+    liq_sats: u64,
+    created: u64,
+    expires: u64,
+    spoof_pk: Option<&str>,
+) -> Event {
+    let lp_pk = spoof_pk
+        .map(str::to_string)
+        .unwrap_or_else(|| keys.public_key().to_hex());
+    let content = serde_json::json!({
+        "version": "p2pfiat-offer/v1",
+        "lpName": "Test-LP",
+        "lpPubkey": lp_pk,
+        "pair": "BTC-USD",
+        "rail": "arkade-mutinynet",
+        "spotUsd": spot,
+        "bidUsd": spot - 50.0,
+        "askUsd": spot + 50.0,
+        "spreadBps": 5,
+        "fundingRateBpsPerDay": funding_bps,
+        "availableLiquiditySats": liq_sats,
+    })
+    .to_string();
+    EventBuilder::new(Kind::Custom(KIND_ORDERBOOK_OFFER), content)
+        .tags([
+            Tag::identifier("p2pfiat:v1:BTC-USD:arkade-mutinynet"),
+            Tag::custom(TagKind::custom("t"), ["p2pfiat-offer"]),
+            Tag::custom(TagKind::custom("expiration"), [expires.to_string()]),
+        ])
+        .custom_created_at(Timestamp::from(created))
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+#[test]
+fn orderbook_weighted_median_and_security_rules() {
+    let t = now();
+    let lp1 = Keys::generate();
+    let lp2 = Keys::generate();
+    let lp3 = Keys::generate();
+    let lp_extreme = Keys::generate();
+    let lp_spoof = Keys::generate();
+
+    // lp1: near-zero yield (0.0 bps), high liquidity (100k) -> weight 100,000 -> price 96,500
+    // lp2: small yield (+1.0 bps), 40k sats -> weight 20,000 -> price 96,600
+    // lp3: higher yield (+9.0 bps), 50k sats -> weight 5,000 -> price 99,000 (outlier)
+    // Weighted median must stay at 96,500 (100k > half of 125k)!
+    let events = vec![
+        ob_offer(&lp1, 96_500.0, 0.0, 100_000, t - 10, t + 120, None),
+        ob_offer(&lp2, 96_600.0, 1.0, 40_000, t - 10, t + 120, None),
+        ob_offer(&lp3, 99_000.0, 9.0, 50_000, t - 10, t + 120, None),
+        // Extreme funding (>20 bps): must be ignored
+        ob_offer(&lp_extreme, 10_000.0, 50.0, 500_000, t - 5, t + 120, None),
+        // Spoofed lpPubkey != event.pubkey: must be ignored
+        ob_offer(&lp_spoof, 10_000.0, 0.0, 500_000, t - 5, t + 120, Some(&lp1.public_key().to_hex())),
+        // Expired offer: must be ignored
+        ob_offer(&Keys::generate(), 10_000.0, 0.0, 500_000, t - 30, t - 1, None),
+    ];
+
+    let r = read_orderbook(&events, t, 180, 3, 20.0).unwrap();
+    assert_eq!(r.lp_count, 3);
+    assert_eq!(r.total_liquidity_sats, 190_000);
+    assert_eq!(r.usd, 96_500.0);
+
+    // Fewer than min_lps must fail
+    assert!(read_orderbook(&events[..2], t, 180, 3, 20.0).is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetches_orderbook_feed_from_a_relay() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let t = now();
+
+    let client = Client::default();
+    client.add_relay(url.as_str()).await.unwrap();
+    client.connect().await;
+    client.wait_for_connection(Duration::from_secs(5)).await;
+
+    for (spot, funding, liq) in [(96_400.0, 2.0, 30_000), (96_500.0, 0.5, 80_000), (96_700.0, 3.0, 30_000)] {
+        let ev = ob_offer(&Keys::generate(), spot, funding, liq, t - 5, t + 120, None);
+        client.send_event(&ev).await.unwrap();
+    }
+
+    let cfg = NostrFeeds {
+        delphi_relay: "ws://127.0.0.1:1".into(),
+        pricestr_relays: vec!["ws://127.0.0.1:1".into()],
+        orderbook_enabled: true,
+        orderbook_relays: vec![url],
+        orderbook_min_lps: 3,
+        ..NostrFeeds::default()
+    };
+    let feeds = fetch_feeds(&cfg, t).await;
+    let ob = feeds.orderbook.unwrap();
+    assert_eq!(ob.lp_count, 3);
+    assert_eq!(ob.usd, 96_500.0);
 }

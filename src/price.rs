@@ -24,6 +24,19 @@ impl Fiat {
     pub fn pair(self) -> String {
         format!("btc{}", self.code().to_lowercase())
     }
+
+    /// Lowercase inverse pair name for social feed tags, e.g. `usdbtc`.
+    pub fn inverse_pair(self) -> String {
+        format!("{}btc", self.code().to_lowercase())
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code.to_ascii_uppercase().as_str() {
+            "USD" => Some(Fiat::Usd),
+            "EUR" => Some(Fiat::Eur),
+            _ => None,
+        }
+    }
 }
 
 /// Exchanges with public, unauthenticated ticker endpoints.

@@ -9,11 +9,12 @@ use crate::config::NostrFeeds;
 use crate::price::{self, Fiat, Quote};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nostr_sdk::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 pub const KIND_DELPHI_AUDIT: u16 = 8078;
 pub const KIND_PRICESTR: u16 = 30078;
+pub const KIND_ORDERBOOK_OFFER: u16 = 38384;
 const DELPHI_WINDOW: &str = "chain-1h";
 /// Tolerated clock difference for feed timestamps.
 const MAX_FUTURE_SECS: u64 = 120;
@@ -32,16 +33,29 @@ pub struct PriceStrReading {
     pub age_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderBookReading {
+    pub usd: f64,
+    pub lp_count: usize,
+    pub total_liquidity_sats: u64,
+    pub age_secs: u64,
+}
+
 /// Latest feed readings, or why each one is unavailable.
 #[derive(Debug, Clone)]
 pub struct Feeds {
     pub delphi: Result<DelphiReading, String>,
     pub pricestr: Result<PriceStrReading, String>,
+    pub orderbook: Result<OrderBookReading, String>,
 }
 
 impl Feeds {
     pub fn disabled() -> Self {
-        Self { delphi: Err("disabled".into()), pricestr: Err("disabled".into()) }
+        Self {
+            delphi: Err("disabled".into()),
+            pricestr: Err("disabled".into()),
+            orderbook: Err("disabled".into()),
+        }
     }
 }
 
@@ -121,6 +135,121 @@ pub fn read_pricestr(events: &[Event], publisher: &PublicKey, now: u64, max_age:
     Err(last_error)
 }
 
+fn weighted_median(mut items: Vec<(f64, f64)>) -> Option<f64> {
+    items.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total_w: f64 = items.iter().map(|(_, w)| *w).sum();
+    if !(total_w.is_finite() && total_w > 0.0) {
+        return None;
+    }
+    let half = total_w / 2.0;
+    let mut acc = 0.0;
+    for i in 0..items.len() {
+        acc += items[i].1;
+        if acc > half {
+            return Some(items[i].0);
+        }
+        if (acc - half).abs() < f64::EPSILON && i + 1 < items.len() {
+            return Some((items[i].0 + items[i + 1].0) / 2.0);
+        }
+    }
+    items.last().map(|(v, _)| *v)
+}
+
+/// Aggregate active p2pFiat Nostr Offer Book events (`kind: 38384`) into a single BTC/USD quote.
+///
+/// Deduplicates by LP pubkey (keeping the newest valid offer per LP), verifies
+/// signature + NIP-40 expiration + `lpPubkey == event.pubkey`, filters out
+/// extreme basis quotes (`|fundingRateBpsPerDay| > max_abs_funding_bps`), requires
+/// at least `min_lps` distinct LPs, and computes the **weighted median** mid-price
+/// with `weight = availableLiquiditySats / (1 + |fundingRateBpsPerDay|)`.
+pub fn read_orderbook(
+    events: &[Event],
+    now: u64,
+    max_age: u64,
+    min_lps: usize,
+    max_abs_funding_bps: f64,
+) -> Result<OrderBookReading> {
+    // Keep only the newest verified kind:38384 event per LP pubkey.
+    let mut latest_by_lp: HashMap<PublicKey, &Event> = HashMap::new();
+    for e in events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(KIND_ORDERBOOK_OFFER))
+        .filter(|e| e.verify().is_ok())
+    {
+        latest_by_lp
+            .entry(e.pubkey)
+            .and_modify(|cur| {
+                if e.created_at > cur.created_at {
+                    *cur = e;
+                }
+            })
+            .or_insert(e);
+    }
+
+    let mut weighted: Vec<(f64, f64)> = Vec::new();
+    let mut total_liq: u64 = 0;
+    let mut newest_age: u64 = u64::MAX;
+
+    for (pk, e) in latest_by_lp {
+        let Ok(a) = age(e, now, max_age) else { continue };
+        // NIP-40 expiration must be strictly in the future.
+        let exp = e
+            .tags
+            .iter()
+            .map(|t| t.as_slice())
+            .find(|t| t.first().is_some_and(|k| k == "expiration"))
+            .and_then(|t| t.get(1))
+            .and_then(|s| s.parse::<u64>().ok());
+        if !exp.is_some_and(|ts| ts > now) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.content) else { continue };
+        if v["lpPubkey"].as_str() != Some(pk.to_hex().as_str()) {
+            continue;
+        }
+        if let Some(pair) = v["pair"].as_str() {
+            if !pair.eq_ignore_ascii_case("BTC-USD") {
+                continue;
+            }
+        }
+        let Some(spot) = v["spotUsd"].as_f64().filter(|p| is_valid_price(*p)) else {
+            continue;
+        };
+        let mid = match (
+            v["bidUsd"].as_f64().filter(|p| is_valid_price(*p)),
+            v["askUsd"].as_f64().filter(|p| is_valid_price(*p)),
+        ) {
+            (Some(b), Some(a)) => (b + a) / 2.0,
+            _ => spot,
+        };
+        let liq = v["availableLiquiditySats"].as_u64().unwrap_or(0);
+        if liq == 0 {
+            continue;
+        }
+        let funding = v["fundingRateBpsPerDay"].as_f64().unwrap_or(0.0);
+        if !funding.is_finite() || funding.abs() > max_abs_funding_bps {
+            continue;
+        }
+        let weight = (liq as f64) / (1.0 + funding.abs());
+        weighted.push((mid, weight));
+        total_liq = total_liq.saturating_add(liq);
+        newest_age = newest_age.min(a);
+    }
+
+    ensure!(
+        weighted.len() >= min_lps,
+        "only {} valid orderbook LPs, need {min_lps}",
+        weighted.len()
+    );
+    let usd = weighted_median(weighted.clone()).context("empty orderbook weights")?;
+    Ok(OrderBookReading {
+        usd,
+        lp_count: weighted.len(),
+        total_liquidity_sats: total_liq,
+        age_secs: if newest_age == u64::MAX { 0 } else { newest_age },
+    })
+}
+
 /// The nostr feeds as quotes in `fiat`. `exchange_rate` is EUR per USD implied by
 /// the exchanges, used when PriceStr publishes no rate.
 pub fn nostr_quotes(fiat: Fiat, feeds: &Feeds, exchange_rate: Option<f64>) -> Vec<Quote> {
@@ -136,6 +265,9 @@ pub fn nostr_quotes(fiat: Fiat, feeds: &Feeds, exchange_rate: Option<f64>) -> Ve
     }
     if let Ok(r) = &feeds.pricestr {
         out.push(Quote { source: "pricestr", price: r.usd * rate });
+    }
+    if let Ok(r) = &feeds.orderbook {
+        out.push(Quote { source: "orderbook", price: r.usd * rate });
     }
     out
 }
@@ -169,6 +301,9 @@ pub async fn fetch_feeds(cfg: &NostrFeeds, now: u64) -> Feeds {
     let client = Client::default();
     let mut urls: Vec<String> = cfg.pricestr_relays.clone();
     urls.push(cfg.delphi_relay.clone());
+    if cfg.orderbook_enabled {
+        urls.extend(cfg.orderbook_relays.iter().cloned());
+    }
     for u in &urls {
         if let Err(e) = client.add_relay(u.as_str()).await {
             log::warn!("feed relay {u}: {e}");
@@ -210,6 +345,31 @@ pub async fn fetch_feeds(cfg: &NostrFeeds, now: u64) -> Feeds {
     .await
     .map_err(|e: anyhow::Error| format!("{e:#}"));
 
+    let orderbook = if cfg.orderbook_enabled {
+        async {
+            let filter = Filter::new()
+                .kind(Kind::Custom(KIND_ORDERBOOK_OFFER))
+                .custom_tag(SingleLetterTag::lowercase(Alphabet::T), cfg.orderbook_tag.as_str())
+                .since(Timestamp::from(now.saturating_sub(cfg.orderbook_max_age_secs)))
+                .limit(100);
+            let relays: Vec<&str> = cfg.orderbook_relays.iter().map(String::as_str).collect();
+            let events = client
+                .fetch_events_from(relays, filter, Duration::from_secs(8))
+                .await?;
+            read_orderbook(
+                &events.to_vec(),
+                now,
+                cfg.orderbook_max_age_secs,
+                cfg.orderbook_min_lps,
+                cfg.orderbook_max_abs_funding_bps,
+            )
+        }
+        .await
+        .map_err(|e: anyhow::Error| format!("{e:#}"))
+    } else {
+        Err("disabled".into())
+    };
+
     client.disconnect().await;
     if let Err(e) = &delphi {
         log::warn!("delphi feed unavailable: {e}");
@@ -217,7 +377,12 @@ pub async fn fetch_feeds(cfg: &NostrFeeds, now: u64) -> Feeds {
     if let Err(e) = &pricestr {
         log::warn!("pricestr feed unavailable: {e}");
     }
-    Feeds { delphi, pricestr }
+    if cfg.orderbook_enabled {
+        if let Err(e) = &orderbook {
+            log::warn!("orderbook feed unavailable: {e}");
+        }
+    }
+    Feeds { delphi, pricestr, orderbook }
 }
 
 #[cfg(test)]
@@ -228,6 +393,7 @@ mod tests {
         Feeds {
             delphi: Ok(DelphiReading { usd: 60_000.0, age_secs: 600 }),
             pricestr: Ok(PriceStrReading { usd: 61_000.0, eur_per_usd: eur, age_secs: 10 }),
+            orderbook: Err("disabled".into()),
         }
     }
 

@@ -53,6 +53,36 @@ pub struct Config {
     /// Price feeds read from nostr, used as extra quotes in the median.
     #[serde(default)]
     pub nostr_feeds: NostrFeeds,
+    /// Optional kind-1 social feed posts of attested prices (BTC/USD, USD/BTC, ...).
+    #[serde(default)]
+    pub social_feed: SocialFeed,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SocialFeed {
+    /// Post attested public prices as Nostr kind-1 text notes.
+    pub enabled: bool,
+    /// Minimum spacing between kind-1 posts per currency pair (default: 3600s).
+    pub min_interval_secs: u64,
+    /// Also include the inverse pair (e.g. USD/BTC & sats/USD) in text and tags.
+    pub include_inverse: bool,
+    /// Extra hashtags appended to every social price note.
+    pub hashtags: Vec<String>,
+    /// Nostr npubs (or `nostr:npub...`) to mention in every social price note (NIP-27 + `p` tag).
+    pub mentions: Vec<String>,
+}
+
+impl Default for SocialFeed {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_interval_secs: 3600,
+            include_inverse: true,
+            hashtags: vec!["nostracle".into(), "p2pfiat".into()],
+            mentions: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +97,17 @@ pub struct NostrFeeds {
     pub pricestr_relays: Vec<String>,
     /// Ignore PriceStr readings older than this.
     pub pricestr_max_age_secs: u64,
+    /// Also read the p2pFiat Nostr Offer Book (kind 38384) as a price source,
+    /// aggregated via liquidity- & near-zero-yield-weighted median.
+    pub orderbook_enabled: bool,
+    pub orderbook_relays: Vec<String>,
+    pub orderbook_tag: String,
+    /// Minimum distinct verified LPs required before the orderbook yields a quote.
+    pub orderbook_min_lps: usize,
+    /// Ignore orderbook offers older than this.
+    pub orderbook_max_age_secs: u64,
+    /// Ignore offers with |fundingRateBpsPerDay| above this threshold.
+    pub orderbook_max_abs_funding_bps: f64,
 }
 
 impl Default for NostrFeeds {
@@ -79,6 +120,16 @@ impl Default for NostrFeeds {
             pricestr_pubkey: "c6326ba648f2645f419a63e03c525b3547688a3aadab82c9678c18258eb71239".into(),
             pricestr_relays: vec!["wss://relay.damus.io".into(), "wss://relay.primal.net".into()],
             pricestr_max_age_secs: 120,
+            orderbook_enabled: false,
+            orderbook_relays: vec![
+                "wss://relay.damus.io".into(),
+                "wss://nos.lol".into(),
+                "wss://relay.primal.net".into(),
+            ],
+            orderbook_tag: "p2pfiat-offer".into(),
+            orderbook_min_lps: 3,
+            orderbook_max_age_secs: 180,
+            orderbook_max_abs_funding_bps: 20.0,
         }
     }
 }
@@ -192,12 +243,27 @@ impl Config {
             self.min_agreeing <= self.min_sources,
             "min_agreeing cannot exceed min_sources"
         );
-        let available = crate::price::ALL_SOURCES.len() + if self.nostr_feeds.enabled { 2 } else { 0 };
+        let available = crate::price::ALL_SOURCES.len()
+            + if self.nostr_feeds.enabled {
+                2 + if self.nostr_feeds.orderbook_enabled { 1 } else { 0 }
+            } else {
+                0
+            };
         anyhow::ensure!(
             self.min_sources <= available,
             "min_sources ({}) exceeds the {available} available feeds",
             self.min_sources
         );
+        if self.nostr_feeds.enabled && self.nostr_feeds.orderbook_enabled {
+            anyhow::ensure!(
+                self.nostr_feeds.orderbook_min_lps >= 1,
+                "nostr_feeds.orderbook_min_lps must be >= 1"
+            );
+            anyhow::ensure!(
+                self.nostr_feeds.orderbook_max_abs_funding_bps >= 0.0,
+                "nostr_feeds.orderbook_max_abs_funding_bps must be >= 0"
+            );
+        }
         anyhow::ensure!(self.min_relay_acks >= 1, "min_relay_acks must be >= 1");
         anyhow::ensure!(
             self.min_relay_acks <= self.relays.len(),
@@ -217,6 +283,12 @@ impl Config {
             anyhow::ensure!(
                 p.zapper_pubkey.is_some() || self.profile.lud16.is_some(),
                 "[pricing] needs profile.lud16 (or zapper_pubkey) to receive zaps"
+            );
+        }
+        if self.social_feed.enabled {
+            anyhow::ensure!(
+                self.social_feed.min_interval_secs >= 60,
+                "social_feed.min_interval_secs must be >= 60 to avoid relay rate-limits"
             );
         }
         Ok(())

@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::feeds::{self, Feeds};
 use crate::nip88;
 use crate::price::{self, Fiat};
+use crate::social;
 use crate::storage::{maturity, FileStorage, Payment, PaymentStatus};
 use crate::zaps::{self, BuyerMessage, VerifiedZap, ZapTarget};
 use anyhow::{anyhow, Context, Result};
@@ -92,6 +93,16 @@ pub fn attestation_is_public(cfg: &Config, maturity: u64, t: u64) -> bool {
     }
 }
 
+pub fn relay_list_event(keys: &Keys, relays: &[String]) -> Result<Event> {
+    let mut list: Vec<(RelayUrl, Option<RelayMetadata>)> = Vec::new();
+    for r in relays {
+        if let Ok(url) = RelayUrl::parse(r) {
+            list.push((url, None));
+        }
+    }
+    Ok(EventBuilder::relay_list(list).sign_with_keys(keys)?)
+}
+
 impl Service {
     /// `publish = false` runs everything except talking to relays.
     pub async fn new(cfg: Config, publish: bool) -> Result<Self> {
@@ -176,6 +187,8 @@ impl Service {
         }
         let ev = EventBuilder::metadata(&md).sign_with_keys(&self.oracle.nostr_keys())?;
         client.send_event(&ev).await?;
+        let rl = relay_list_event(&self.oracle.nostr_keys(), &self.cfg.relays)?;
+        client.send_event(&rl).await?;
         Ok(())
     }
 
@@ -318,7 +331,8 @@ impl Service {
             let ann_ev = match rec.announcement.clone() {
                 Some(e) => e,
                 None => {
-                    let e = nip88::announcement_event(&keys, &ev.announcement, &self.cfg.relays)?;
+                    let fee = self.cfg.pricing.as_ref().map(|p| p.attestation_sats);
+                    let e = nip88::announcement_event(&keys, &ev.announcement, &self.cfg.relays, fee)?;
                     self.oracle.storage.update_nostr(&id, |r| r.announcement = Some(e.clone()))?;
                     e
                 }
@@ -340,12 +354,20 @@ impl Service {
             let send_ann = rec.announcement_acks < need || rebroadcast;
             let public = attestation_is_public(&self.cfg, m, t);
             let send_att = public && att_ev.is_some() && (rec.attestation_acks < need || rebroadcast);
-            if !send_ann && !send_att {
+            let last_social = self.oracle.storage.last_social_post(&unit);
+            let can_social = self.cfg.social_feed.enabled
+                && public
+                && ev.attestation().is_some()
+                && rec.social_note_acks < need
+                && (rec.social_note.is_some()
+                    || t >= last_social.saturating_add(self.cfg.social_feed.min_interval_secs));
+            if !send_ann && !send_att && !can_social {
                 continue;
             }
 
             let mut ann_acks = rec.announcement_acks;
             let mut att_acks = rec.attestation_acks;
+            let mut social_acks = rec.social_note_acks;
             if send_ann {
                 budget -= 1;
                 ann_acks = ann_acks.max(self.send(client, &ann_ev).await);
@@ -357,12 +379,49 @@ impl Service {
                     log::info!("published attestation {id} ({att_acks} relays)");
                 }
             }
+            if can_social {
+                let social_ev = match rec.social_note.clone() {
+                    Some(e) => Some(e),
+                    None => match (Fiat::from_code(&unit), ev.attestation()) {
+                        (Some(fiat), Some(att)) => match social::decode_attested_price(&att) {
+                            Ok(price_fiat) => {
+                                let note = social::price_note(
+                                    &keys,
+                                    fiat,
+                                    price_fiat,
+                                    Some(&id),
+                                    &self.cfg.social_feed,
+                                    att_ev.as_ref().map(|a| a.id),
+                                )?;
+                                self.oracle
+                                    .storage
+                                    .update_nostr(&id, |r| r.social_note = Some(note.clone()))?;
+                                Some(note)
+                            }
+                            Err(e) => {
+                                log::warn!("social note decode {id}: {e:#}");
+                                None
+                            }
+                        },
+                        _ => None,
+                    },
+                };
+                if let Some(note) = &social_ev {
+                    budget = budget.saturating_sub(1);
+                    social_acks = social_acks.max(self.send(client, note).await);
+                    if social_acks >= need && rec.social_note_acks < need {
+                        self.oracle.storage.set_last_social_post(&unit, t)?;
+                        log::info!("published social price note for {id} ({social_acks} relays)");
+                    }
+                }
+            }
             if ann_acks < need {
                 log::warn!("announcement {id}: only {ann_acks}/{need} relays accepted");
             }
             self.oracle.storage.update_nostr(&id, |r| {
                 r.announcement_acks = ann_acks;
                 r.attestation_acks = att_acks;
+                r.social_note_acks = social_acks;
                 r.last_broadcast = t;
             })?;
         }
@@ -494,10 +553,12 @@ impl Service {
             }
         };
         if st.nostr_record(id).announcement.is_none() {
+            let fee = self.cfg.pricing.as_ref().map(|p| p.attestation_sats);
             let e = nip88::announcement_event(
                 &self.oracle.nostr_keys(),
                 &data.announcement,
                 &self.cfg.relays,
+                fee,
             )?;
             st.update_nostr(id, |r| r.announcement = Some(e.clone()))?;
             if let Some(client) = &self.nostr {

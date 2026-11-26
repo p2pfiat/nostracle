@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nostr_sdk::prelude::*;
 use nostracle::zaps::{self, BuyerMessage};
-use nostracle::{config::Config, feeds, nip88, oracle, price, storage::FileStorage};
+use nostracle::{config::Config, dispute, feeds, nip88, oracle, price, social, storage::FileStorage};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,6 +24,12 @@ enum Cmd {
     Pubkey,
     /// Fetch and aggregate current prices without signing anything.
     Price,
+    /// Post current aggregated prices as kind-1 notes to the Nostr social feed.
+    PostPrice {
+        /// Print the signed kind-1 notes without sending them to relays.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the oracle loop.
     Run {
         /// Announce and attest locally but do not publish to relays.
@@ -65,6 +71,15 @@ enum Cmd {
         /// Stop waiting after this many seconds.
         #[arg(long, default_value_t = 900)]
         timeout_secs: u64,
+    },
+    /// Evaluate and sign an On-Demand BIP-342 Dispute request JSON at the live aggregated price.
+    SignDispute {
+        /// Path to the JSON DisputeRequest file.
+        #[arg(long)]
+        request: PathBuf,
+        /// Minimum dispute fee in sats required before signing.
+        #[arg(long, default_value_t = 100)]
+        min_fee_sats: u64,
     },
     /// Skip the nonce counter ahead. REQUIRED after restoring an older db backup.
     BumpNonces {
@@ -109,6 +124,40 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::PostPrice { dry_run } => {
+            let keys = own_keys(&cfg)?;
+            let http = reqwest::Client::new();
+            let nostr_feeds = feeds::fetch_feeds(&cfg.nostr_feeds, oracle::now()).await;
+            let client = if dry_run {
+                None
+            } else {
+                let c = Client::new(keys.clone());
+                for r in &cfg.relays {
+                    c.add_relay(r.as_str()).await?;
+                }
+                c.connect().await;
+                c.wait_for_connection(Duration::from_secs(10)).await;
+                Some(c)
+            };
+            for &f in &cfg.pairs {
+                let quotes = feeds::collect_quotes(&http, f, &nostr_feeds).await;
+                match price::aggregate(&quotes, cfg.min_sources, cfg.min_agreeing, cfg.max_deviation) {
+                    Ok(p) => {
+                        let rounded = p.round().max(0.0) as u64;
+                        let ev = social::price_note(&keys, f, rounded, None, &cfg.social_feed, None)?;
+                        println!("--- {} ({}) ---\n{}\n", f.code(), ev.id, ev.content);
+                        if let Some(c) = &client {
+                            let out = c.send_event(&ev).await?;
+                            println!("published {} to {}/{} relays", ev.id, out.success.len(), cfg.relays.len());
+                        }
+                    }
+                    Err(e) => eprintln!("{} unavailable: {e:#}", f.code()),
+                }
+            }
+            if let Some(c) = client {
+                c.disconnect().await;
+            }
+        }
         Cmd::Run { dry_run, once } => {
             let tick = Duration::from_secs(cfg.tick_secs);
             let svc = oracle::Service::new(cfg, !dry_run).await?;
@@ -149,6 +198,23 @@ async fn main() -> Result<()> {
             std::process::exit(
                 buy(&cfg, keys, oracle_pk, event_id, custom, sats, timeout_secs).await?,
             );
+        }
+        Cmd::SignDispute { request, min_fee_sats } => {
+            let raw = std::fs::read_to_string(&request).with_context(|| format!("read {request:?}"))?;
+            let req: dispute::DisputeRequest = serde_json::from_str(&raw)?;
+            let fiat = cfg
+                .pairs
+                .iter()
+                .copied()
+                .find(|p| p.code().eq_ignore_ascii_case(&req.currency))
+                .with_context(|| format!("unsupported currency {} in config", req.currency))?;
+            let http = reqwest::Client::new();
+            let nostr_feeds = feeds::fetch_feeds(&cfg.nostr_feeds, oracle::now()).await;
+            let quotes = feeds::collect_quotes(&http, fiat, &nostr_feeds).await;
+            let live_spot = price::aggregate(&quotes, cfg.min_sources, cfg.min_agreeing, cfg.max_deviation)?;
+            let sk = oracle::load_key(&cfg.key_file)?;
+            let resp = dispute::evaluate_and_sign_dispute(&sk, &req, live_spot, min_fee_sats)?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Cmd::BumpNonces { by } => {
             let st = FileStorage::open(&cfg.db_file)?;

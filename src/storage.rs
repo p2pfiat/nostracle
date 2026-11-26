@@ -28,6 +28,10 @@ pub struct NostrRecord {
     pub announcement_acks: usize,
     pub attestation: Option<Event>,
     pub attestation_acks: usize,
+    #[serde(default)]
+    pub social_note: Option<Event>,
+    #[serde(default)]
+    pub social_note_acks: usize,
     pub last_broadcast: u64,
 }
 
@@ -67,6 +71,9 @@ struct State {
     missed: BTreeSet<String>,
     #[serde(default)]
     payments: BTreeMap<String, Payment>,
+    /// Unix timestamp of the last kind-1 social feed post per fiat unit (e.g. "USD").
+    #[serde(default)]
+    last_social_post: BTreeMap<String, u64>,
 }
 
 pub struct FileStorage {
@@ -136,6 +143,16 @@ impl FileStorage {
     pub fn update_nostr(&self, event_id: &str, f: impl FnOnce(&mut NostrRecord)) -> Result<()> {
         let mut st = self.state.lock().unwrap();
         f(st.nostr.entry(event_id.to_string()).or_default());
+        self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub fn last_social_post(&self, unit: &str) -> u64 {
+        self.state.lock().unwrap().last_social_post.get(unit).copied().unwrap_or(0)
+    }
+
+    pub fn set_last_social_post(&self, unit: &str, t: u64) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.last_social_post.insert(unit.to_string(), t);
         self.persist(&st).map_err(|e| anyhow::anyhow!("{e}"))
     }
 

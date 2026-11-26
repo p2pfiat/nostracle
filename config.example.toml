@@ -3,11 +3,14 @@ key_file = "data/oracle.key"
 db_file  = "data/events.json"   # BACK UP together with the key (see README)
 
 relays = [
+  "wss://relay.primal.net",
   "wss://relay.damus.io",
   "wss://nos.lol",
-  "wss://relay.primal.net",
+  "wss://relay.snort.social",
+  "wss://nostr.bitcoiner.social",
+  "wss://relay.nostr.band",
 ]
-min_relay_acks   = 2            # published = accepted by at least this many relays
+min_relay_acks   = 3            # published = accepted by at least this many relays
 rebroadcast_secs = 21600        # re-send recent events every 6h
 
 pairs = ["USD", "EUR"]
@@ -34,11 +37,25 @@ horizon_secs  = 7776000
 # enabled = true
 # delphi_max_age_secs   = 10800
 # pricestr_max_age_secs = 120
+# orderbook_enabled = true             # p2pFiat kind:38384 weighted-median price source
+# orderbook_min_lps = 3                # require at least N distinct signed LPs
+# orderbook_max_age_secs = 180
+# orderbook_max_abs_funding_bps = 20.0 # ignore extreme basis quotes
 
+# [profile]
 [profile]
 name  = "nostracle"
 # lud16 = "you@your-lightning-address.com"   # receive zaps
 # website = "https://github.com/p2pfiat/nostracle"
+
+# Optional public kind-1 social feed posts (BTC/USD, USD/BTC, sats/USD) on nostr.
+# Only posts once an attestation is public (never leaks paid attestations early).
+# [social_feed]
+# enabled = true
+# min_interval_secs = 3600
+# include_inverse = true
+# hashtags = ["nostracle", "p2pfiat"]
+# mentions = ["npub1..."]              # optional NIP-27 mentions (`nostr:npub...` + `p` tag)
 
 # Paid attestations over zaps. Needs lud16 above, on a provider that supports zaps.
 # Remove this section to publish all attestations for free.

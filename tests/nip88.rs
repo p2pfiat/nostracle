@@ -15,7 +15,7 @@ async fn setup() -> (tempfile::TempDir, Oracle<FileStorage>, Event, Event) {
     let att = oracle.sign_numeric_event("btceur-2000".into(), 54_321).await.unwrap();
     let keys = oracle.nostr_keys();
     let relays = vec!["wss://relay.example".to_string()];
-    let ann_ev = nip88::announcement_event(&keys, &ann, &relays).unwrap();
+    let ann_ev = nip88::announcement_event(&keys, &ann, &relays, Some(150)).unwrap();
     let att_ev = nip88::attestation_event(&keys, &att, "EUR", ann_ev.id).unwrap();
     (dir, oracle, ann_ev, att_ev)
 }
@@ -33,6 +33,7 @@ async fn events_roundtrip_and_verify() {
     assert_eq!(tag(&ann_ev, "relays")[0][1..], ["wss://relay.example".to_string()]);
     assert_eq!(tag(&ann_ev, "title").len(), 1);
     assert_eq!(tag(&ann_ev, "description").len(), 1);
+    assert_eq!(nip88::announcement_fee_sats(&ann_ev), Some(150));
     let n: Vec<_> = tag(&ann_ev, "n").iter().map(|v| v[1].clone()).collect();
     assert_eq!(n, ["BTC", "EUR"]);
     assert_eq!(tag(&att_ev, "e")[0][1], ann_ev.id.to_hex());

@@ -111,6 +111,22 @@ Know the limits:
 - **A buyer can share the attestation** after receiving it.
 - If nobody buys an attestation, it is never released and contracts refund.
 
+## On-Demand BIP-342 Dispute Signer (`sign-dispute`)
+
+For long-term Arkade DLCs (7d / 30d / 90d), contracts can include an optional **Leaf 2 On-Demand Dispute Path** (`<csv> OP_CSV OP_DROP <O1> OP_CHECKSIG <O2> OP_CHECKSIGADD ... <k> OP_GREATERTHANOREQUAL`).
+
+If a counterparty goes offline mid-term or BTC drops ≥ 50% before maturity, either party (or a Watchtower) can submit a deterministic dispute transaction + contract terms to a `k-of-n` Nostracle quorum:
+
+```sh
+cargo run -- sign-dispute --request dispute-request.json
+```
+
+Each Nostracle independently (`src/dispute.rs`):
+1. Fetches the current median spot price (`BTC/USD` or `BTC/EUR`).
+2. Recomputes the exact satoshi payout split from the contract terms (`notional`, `entry_spot`, `side`, `leverage`, `total_collateral`, optional `bounty`).
+3. Verifies that the submitted transaction's outputs match the computed payout within rounding tolerance (1 sat).
+4. Returns its BIP-340 Tapscript signature over the BIP-341 sighash — preventing cherry-picking because the quorum signs the live spot price at exit time `T`.
+
 ## Operating it
 
 Deployment files: [`Dockerfile`](Dockerfile) (with a `status` healthcheck),

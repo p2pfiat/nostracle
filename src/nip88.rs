@@ -49,6 +49,7 @@ pub fn announcement_event(
     keys: &Keys,
     ann: &OracleAnnouncement,
     relays: &[String],
+    fee_sats: Option<u64>,
 ) -> Result<Event> {
     let unit = unit_of(ann).ok_or_else(|| anyhow!("only numeric events supported"))?;
     let maturity = ann.oracle_event.event_maturity_epoch;
@@ -64,11 +65,20 @@ pub fn announcement_event(
                 ann.oracle_event.event_id
             )],
         ),
+        Tag::custom(TagKind::custom("fee_sats"), [fee_sats.unwrap_or(0).to_string()]),
     ];
     tags.extend(n_tags(unit));
     Ok(EventBuilder::new(Kind::Custom(KIND_ANNOUNCEMENT), B64.encode(ann.encode()))
         .tags(tags)
         .sign_with_keys(keys)?)
+}
+
+/// Read the advertised zap fee (`["fee_sats", "<sats>"]`) from a kind-88 announcement.
+pub fn announcement_fee_sats(ev: &Event) -> Option<u64> {
+    tag_values(ev, "fee_sats")
+        .first()
+        .and_then(|v| v.first())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 pub fn attestation_event(
