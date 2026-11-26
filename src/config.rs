@@ -108,6 +108,10 @@ pub struct NostrFeeds {
     pub orderbook_max_age_secs: u64,
     /// Ignore offers with |fundingRateBpsPerDay| above this threshold.
     pub orderbook_max_abs_funding_bps: f64,
+    /// Outlier filter applied to orderbook offers around each side's raw weighted median (0.02 = 2%).
+    pub orderbook_max_offer_deviation: f64,
+    /// Require Arkade Proof-of-Funds verification before counting an orderbook offer.
+    pub orderbook_require_pof: bool,
 }
 
 impl Default for NostrFeeds {
@@ -130,6 +134,8 @@ impl Default for NostrFeeds {
             orderbook_min_lps: 3,
             orderbook_max_age_secs: 180,
             orderbook_max_abs_funding_bps: 20.0,
+            orderbook_max_offer_deviation: 0.02,
+            orderbook_require_pof: true,
         }
     }
 }

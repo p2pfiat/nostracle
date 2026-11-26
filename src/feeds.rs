@@ -155,21 +155,48 @@ fn weighted_median(mut items: Vec<(f64, f64)>) -> Option<f64> {
     items.last().map(|(v, _)| *v)
 }
 
+fn robust_weighted_median(items: Vec<(f64, f64)>, max_offer_deviation: f64) -> Option<f64> {
+    if items.is_empty() {
+        return None;
+    }
+    let raw_med = weighted_median(items.clone())?;
+    if !is_valid_price(raw_med) {
+        return None;
+    }
+    let inliers: Vec<(f64, f64)> = items
+        .iter()
+        .copied()
+        .filter(|(p, _)| ((p - raw_med).abs() / raw_med) <= max_offer_deviation)
+        .collect();
+    if inliers.is_empty() {
+        Some(raw_med)
+    } else {
+        weighted_median(inliers)
+    }
+}
+
 /// Aggregate active p2pFiat Nostr Offer Book events (`kind: 38384`) into a single BTC/USD quote.
 ///
-/// Deduplicates by LP pubkey (keeping the newest valid offer per LP), verifies
-/// signature + NIP-40 expiration + `lpPubkey == event.pubkey`, filters out
-/// extreme basis quotes (`|fundingRateBpsPerDay| > max_abs_funding_bps`), requires
-/// at least `min_lps` distinct LPs, and computes the **weighted median** mid-price
-/// with `weight = availableLiquiditySats / (1 + |fundingRateBpsPerDay|)`.
-pub fn read_orderbook(
+/// Security & bias-elimination design:
+/// - Deduplicates by LP/maker pubkey (newest verified event per pubkey), checking signature,
+///   NIP-40 expiration, and `lpPubkey == event.pubkey`.
+/// - When `verified_pof_sats` is provided (Arkade Proof-of-Funds), ONLY offers with verified
+///   on-Arkade liquidity > 0 are counted, weighted by `min(advertised, verified)`.
+/// - Splits offers into **Short (Stable)** and **Long (2×)** books (two-sided LPs contribute
+///   `bid` to Short and `ask` to Long; one-sided P2P offers contribute to their declared side).
+/// - Applies an offer-level **outlier filter** (`max_offer_deviation`, e.g. 2%) around each side's
+///   liquidity-weighted median so extreme spoofed prices cannot skew the estimate.
+/// - Averages the Short and Long weighted medians `(short_med + long_med) / 2` so positive-APR
+///   Short discounts and Long premiums cancel each other out.
+pub fn read_orderbook_with_pof(
     events: &[Event],
     now: u64,
     max_age: u64,
     min_lps: usize,
     max_abs_funding_bps: f64,
+    max_offer_deviation: f64,
+    verified_pof_sats: Option<&HashMap<String, u64>>,
 ) -> Result<OrderBookReading> {
-    // Keep only the newest verified kind:38384 event per LP pubkey.
     let mut latest_by_lp: HashMap<PublicKey, &Event> = HashMap::new();
     for e in events
         .iter()
@@ -186,13 +213,14 @@ pub fn read_orderbook(
             .or_insert(e);
     }
 
-    let mut weighted: Vec<(f64, f64)> = Vec::new();
+    let mut short_items: Vec<(f64, f64)> = Vec::new();
+    let mut long_items: Vec<(f64, f64)> = Vec::new();
+    let mut valid_lps: usize = 0;
     let mut total_liq: u64 = 0;
     let mut newest_age: u64 = u64::MAX;
 
     for (pk, e) in latest_by_lp {
         let Ok(a) = age(e, now, max_age) else { continue };
-        // NIP-40 expiration must be strictly in the future.
         let exp = e
             .tags
             .iter()
@@ -204,7 +232,8 @@ pub fn read_orderbook(
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.content) else { continue };
-        if v["lpPubkey"].as_str() != Some(pk.to_hex().as_str()) {
+        let pk_hex = pk.to_hex();
+        if v["lpPubkey"].as_str() != Some(pk_hex.as_str()) {
             continue;
         }
         if let Some(pair) = v["pair"].as_str() {
@@ -212,42 +241,92 @@ pub fn read_orderbook(
                 continue;
             }
         }
-        let Some(spot) = v["spotUsd"].as_f64().filter(|p| is_valid_price(*p)) else {
+        let Some(spot) = v["spotPrice"]
+            .as_f64()
+            .or_else(|| v["spotUsd"].as_f64())
+            .filter(|p| is_valid_price(*p))
+        else {
             continue;
         };
-        let mid = match (
-            v["bidUsd"].as_f64().filter(|p| is_valid_price(*p)),
-            v["askUsd"].as_f64().filter(|p| is_valid_price(*p)),
-        ) {
-            (Some(b), Some(a)) => (b + a) / 2.0,
-            _ => spot,
+        let advertised_liq = v["availableLiquiditySats"].as_u64().unwrap_or(0);
+        let effective_liq = match verified_pof_sats {
+            Some(pof_map) => {
+                let pof = pof_map.get(&pk_hex).copied().unwrap_or(0);
+                if pof == 0 {
+                    continue;
+                }
+                if advertised_liq > 0 { advertised_liq.min(pof) } else { pof }
+            }
+            None => {
+                if advertised_liq == 0 {
+                    continue;
+                }
+                advertised_liq
+            }
         };
-        let liq = v["availableLiquiditySats"].as_u64().unwrap_or(0);
-        if liq == 0 {
-            continue;
-        }
         let funding = v["fundingRateBpsPerDay"].as_f64().unwrap_or(0.0);
         if !funding.is_finite() || funding.abs() > max_abs_funding_bps {
             continue;
         }
-        let weight = (liq as f64) / (1.0 + funding.abs());
-        weighted.push((mid, weight));
-        total_liq = total_liq.saturating_add(liq);
+        let weight = (effective_liq as f64) / (1.0 + funding.abs());
+        let bid = v["bidPrice"]
+            .as_f64()
+            .or_else(|| v["bidUsd"].as_f64())
+            .filter(|p| is_valid_price(*p))
+            .unwrap_or(spot);
+        let ask = v["askPrice"]
+            .as_f64()
+            .or_else(|| v["askUsd"].as_f64())
+            .filter(|p| is_valid_price(*p))
+            .unwrap_or(spot);
+
+        if v["makerType"].as_str() == Some("p2p") {
+            match v["makerSide"].as_str() {
+                Some("short") => short_items.push((spot, weight)),
+                Some("long") => long_items.push((spot, weight)),
+                _ => {
+                    short_items.push((bid, weight));
+                    long_items.push((ask, weight));
+                }
+            }
+        } else {
+            short_items.push((bid, weight));
+            long_items.push((ask, weight));
+        }
+        valid_lps += 1;
+        total_liq = total_liq.saturating_add(effective_liq);
         newest_age = newest_age.min(a);
     }
 
     ensure!(
-        weighted.len() >= min_lps,
-        "only {} valid orderbook LPs, need {min_lps}",
-        weighted.len()
+        valid_lps >= min_lps,
+        "only {valid_lps} valid Proof-of-Funds orderbook LPs, need {min_lps}"
     );
-    let usd = weighted_median(weighted.clone()).context("empty orderbook weights")?;
+    let short_med = robust_weighted_median(short_items, max_offer_deviation);
+    let long_med = robust_weighted_median(long_items, max_offer_deviation);
+    let usd = match (short_med, long_med) {
+        (Some(s), Some(l)) => (s + l) / 2.0,
+        (Some(s), None) => s,
+        (None, Some(l)) => l,
+        (None, None) => bail!("empty orderbook weights"),
+    };
     Ok(OrderBookReading {
         usd,
-        lp_count: weighted.len(),
+        lp_count: valid_lps,
         total_liquidity_sats: total_liq,
         age_secs: if newest_age == u64::MAX { 0 } else { newest_age },
     })
+}
+
+/// Backwards-compatible wrapper using default 2% offer outlier filter without external PoF map.
+pub fn read_orderbook(
+    events: &[Event],
+    now: u64,
+    max_age: u64,
+    min_lps: usize,
+    max_abs_funding_bps: f64,
+) -> Result<OrderBookReading> {
+    read_orderbook_with_pof(events, now, max_age, min_lps, max_abs_funding_bps, 0.02, None)
 }
 
 /// The nostr feeds as quotes in `fiat`. `exchange_rate` is EUR per USD implied by
@@ -416,5 +495,62 @@ mod tests {
     #[test]
     fn unavailable_feeds_add_no_quotes() {
         assert!(nostr_quotes(Fiat::Usd, &Feeds::disabled(), None).is_empty());
+    }
+
+    #[test]
+    fn orderbook_balanced_short_long_weighted_median_rejects_spoofers_and_unfunded() {
+        let now = 1_760_000_000u64;
+        let mk_offer = |keys: &Keys, side: Option<&str>, spot: f64, bid: f64, ask: f64, liq: u64| -> Event {
+            let mut body = serde_json::json!({
+                "lpPubkey": keys.public_key().to_hex(),
+                "pair": "BTC-USD",
+                "spotPrice": spot,
+                "bidPrice": bid,
+                "askPrice": ask,
+                "availableLiquiditySats": liq,
+                "fundingRateBpsPerDay": 3.0,
+            });
+            if let Some(s) = side {
+                body["makerType"] = serde_json::json!("p2p");
+                body["makerSide"] = serde_json::json!(s);
+            }
+            EventBuilder::new(Kind::Custom(KIND_ORDERBOOK_OFFER), body.to_string())
+                .tags([Tag::custom(TagKind::custom("expiration"), [(now + 300).to_string()])])
+                .custom_created_at(Timestamp::from(now - 5))
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+
+        let k_short = Keys::generate();
+        let k_long = Keys::generate();
+        let k_spoof_outlier = Keys::generate();
+        let k_unfunded = Keys::generate();
+
+        // Short quotes $59,700 (-0.5% APR discount), Long quotes $60,300 (+0.5% premium) -> balanced mid = $60,000!
+        let ev_short = mk_offer(&k_short, Some("short"), 59_700.0, 59_700.0, 59_700.0, 500_000);
+        let ev_long = mk_offer(&k_long, Some("long"), 60_300.0, 60_300.0, 60_300.0, 500_000);
+        // Funded spoofer tries to skew short side with $999,999 (smaller weight) -> ignored by weighted median + 2% filter
+        let ev_spoof = mk_offer(&k_spoof_outlier, Some("short"), 999_999.0, 999_999.0, 999_999.0, 100_000);
+        // Unfunded Sybil claims 100 BTC at $1 -> excluded completely by Proof-of-Funds map
+        let ev_unfunded = mk_offer(&k_unfunded, Some("long"), 1.0, 1.0, 1.0, 10_000_000_000);
+
+        let mut pof = HashMap::new();
+        pof.insert(k_short.public_key().to_hex(), 500_000);
+        pof.insert(k_long.public_key().to_hex(), 500_000);
+        pof.insert(k_spoof_outlier.public_key().to_hex(), 100_000);
+        // k_unfunded intentionally absent (0 PoF)
+
+        let r = read_orderbook_with_pof(
+            &[ev_short, ev_long, ev_spoof, ev_unfunded],
+            now,
+            180,
+            2,
+            20.0,
+            0.02,
+            Some(&pof),
+        )
+        .unwrap();
+        assert!((r.usd - 60_000.0).abs() < 1e-6, "expected balanced mid $60,000, got {}", r.usd);
+        assert_eq!(r.lp_count, 3);
     }
 }
