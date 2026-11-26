@@ -32,6 +32,9 @@ use std::str::FromStr;
 
 const DUST_SATS: u64 = 350;
 const PAYOUT_TOLERANCE_SATS: u64 = 1;
+/// Maximum allowed L1 miner fee (5,000 sats) deducted from the contract pool for a Leaf 2
+/// dispute transaction so it passes Bitcoin L1 mempool relay without enabling fee-burn griefing.
+const MAX_MINER_FEE_SATS: u64 = 5_000;
 /// Maximum allowed spot price drift (±1%) between the client's tx build time and each
 /// oracle's live tick so a k-of-n quorum can still converge on one tx during volatile crashes
 /// while rejecting any meaningful theft attempt.
@@ -53,6 +56,9 @@ pub struct DisputeRequest {
     pub dispute_timestamp: u64,
     pub funding_rate_bps_per_day: f64,
     pub bounty_sats: u64,
+    /// Optional Bitcoin L1 miner fee (0..=5000 sats) left as `inputs - outputs` for mempool relay.
+    #[serde(default)]
+    pub miner_fee_sats: u64,
     pub fee_paid_sats: u64,
     /// User x-only secp256k1 public key (64 hex chars).
     pub user_pubkey_hex: String,
@@ -165,10 +171,17 @@ pub fn compute_dispute_payouts(req: &DisputeRequest, live_spot_price: f64) -> Re
     if req.dispute_timestamp < req.opened_at {
         bail!("dispute_timestamp precedes opened_at");
     }
-    if req.total_collateral_sats < req.bounty_sats + DUST_SATS * 2 {
-        bail!("total_collateral_sats too small after watchtower bounty");
+    if req.miner_fee_sats > MAX_MINER_FEE_SATS {
+        bail!(
+            "miner_fee_sats {} exceeds maximum allowed {}",
+            req.miner_fee_sats,
+            MAX_MINER_FEE_SATS
+        );
     }
-    let distributable = req.total_collateral_sats - req.bounty_sats;
+    if req.total_collateral_sats < req.bounty_sats + req.miner_fee_sats + DUST_SATS * 2 {
+        bail!("total_collateral_sats too small after watchtower bounty and miner fee");
+    }
+    let distributable = req.total_collateral_sats - req.bounty_sats - req.miner_fee_sats;
     let elapsed_secs = (req.dispute_timestamp - req.opened_at) as f64;
     let accrued_fiat = req.notional_fiat * (req.funding_rate_bps_per_day / 10_000.0) * (elapsed_secs / 86_400.0);
 
@@ -253,9 +266,9 @@ pub fn evaluate_and_sign_dispute(
         );
     }
     ensure!(
-        actual_user + actual_lp + req.bounty_sats == req.total_collateral_sats,
-        "dispute tx outputs ({}) must exactly equal total_collateral_sats ({})",
-        actual_user + actual_lp + req.bounty_sats,
+        actual_user + actual_lp + req.bounty_sats + req.miner_fee_sats == req.total_collateral_sats,
+        "dispute tx outputs + miner_fee ({}) must exactly equal total_collateral_sats ({})",
+        actual_user + actual_lp + req.bounty_sats + req.miner_fee_sats,
         req.total_collateral_sats
     );
 
@@ -445,6 +458,7 @@ mod tests {
             dispute_timestamp: 1_795_000_000 + 5 * 86_400,
             funding_rate_bps_per_day: funding,
             bounty_sats: bounty,
+            miner_fee_sats: 350,
             fee_paid_sats: 150,
             user_pubkey_hex: String::new(),
             lp_pubkey_hex: String::new(),
@@ -497,7 +511,7 @@ mod tests {
         let sk = oracle_sk();
         let req = build_valid_req("short", 3.0, 27_000.0, 600);
         let res = evaluate_and_sign_dispute(&sk, &req, 27_000.0, 100).unwrap();
-        assert_eq!(res.user_payout_sats, 333_334 - 600 - DUST_SATS);
+        assert_eq!(res.user_payout_sats, 333_334 - 600 - 350 - DUST_SATS);
         assert_eq!(res.lp_payout_sats, DUST_SATS);
     }
 
@@ -563,5 +577,14 @@ mod tests {
         req.notional_fiat = 200.0;
         let err = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap_err();
         assert!(err.to_string().contains("manifest_sig verification failed"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn rejects_excessive_miner_fee_burn() {
+        let sk = oracle_sk();
+        let mut req = build_valid_req("short", 3.0, 72_000.0, 600);
+        req.miner_fee_sats = MAX_MINER_FEE_SATS + 1;
+        let err = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum allowed"), "unexpected err: {err}");
     }
 }
