@@ -50,6 +50,52 @@ use it.
 - if no reliable price is available within `max_attest_delay_secs` after
   maturity, the event is **not** attested and contracts take their refund path
 
+## 1-Prompt Setup with an AI Agent (Umbrel / Linux)
+
+The fastest way to run a 24/7 Nostracle on an Umbrel (Raspberry Pi ARM64) or any Linux VPS is to paste this single prompt into Claude Code, Cursor, Codex, or Antigravity:
+
+```text
+Install and run https://github.com/p2pfiat/nostracle 24/7 with Docker on my Umbrel (umbrel@home.local) or Linux server. Ask me for my oracle name and optional Lightning address first, initialize the keypair, verify `nostracle status`, and print my npub1… so I can join the p2pFiat quorum.
+```
+
+*(Works out of the box with the included [`Dockerfile`](Dockerfile) and [`config.example.toml`](config.example.toml). Always back up `data/oracle.key` and `data/events.json` together — see [Keys and backups](#operating-it) below.)*
+
+<details>
+<summary>📋 <strong>Full step-by-step AI Agent System Prompt (expand to copy)</strong></summary>
+
+```markdown
+You are a Bitcoin & Linux DevOps engineer. Set up a production 24/7 `nostracle` DLC price oracle (BTC/USD + BTC/EUR + live NIP-17 `sign_dispute` RPC signer for p2pFiat) on this machine using Docker Compose.
+
+Before starting, ask me ONLY 3 short questions:
+1. A display name for my Nostracle (e.g. `Nostracle-Amsterdam`)
+2. Optional Lightning Address (`lud16`, e.g. `me@getalby.com`) to receive NIP-57 zaps (or leave blank for free public attestations)
+3. Whether to run on this local Linux machine or over SSH on my Umbrel (e.g. `umbrel@home.local`)
+
+Then perform these exact steps automatically:
+1. Clone `https://github.com/p2pfiat/nostracle.git` into `~/nostracle` (or `git pull origin main` if it already exists).
+2. Create `~/nostracle/data` and copy `config.example.toml` to `~/nostracle/config.toml`.
+3. Configure `~/nostracle/config.toml`:
+   - Set `[profile]` `name` (and `lud16` if provided).
+   - Keep `pairs = ["USD", "EUR"]`, `min_sources = 5`, `min_agreeing = 3`, `max_deviation = 0.01`, and relays including `wss://relay.primal.net`, `wss://relay.damus.io`, `wss://nos.lol`, `wss://nostr.bitcoiner.social`, and `wss://nostr.oxtr.dev`.
+   - Ensure `[nostr_feeds]` `enabled = true`.
+4. Create `~/nostracle/docker-compose.yml` building from the local `Dockerfile` with:
+   - `restart: unless-stopped`
+   - Volumes mounting `./config.toml:/var/lib/nostracle/config.toml:ro` and `./data:/var/lib/nostracle/data`
+   - Ensure `./data` is writable by the container's `nostracle` user (`chmod 777 ~/nostracle/data` or matching UID).
+5. Build the Docker image (`sudo docker compose build`), initialize the oracle keypair & database ONCE if `~/nostracle/data/oracle.key` does not exist yet:
+   `sudo docker compose run --rm nostracle init`
+6. Start the oracle daemon (`sudo docker compose up -d`), wait 15 seconds, and verify:
+   - `sudo docker compose exec nostracle nostracle -c config.toml pubkey`
+   - `sudo docker compose exec nostracle nostracle -c config.toml status`
+   - `sudo docker compose logs --tail=20`
+7. Report back:
+   - My Nostracle's **`npub1…`** (so I can share it with `@p2pfiat` to join the NIP-51 curated quorum!)
+   - Confirmation that `status` is healthy and price feeds are working
+   - A clear reminder to ALWAYS back up `data/oracle.key` and `data/events.json` TOGETHER (never restore an older `events.json` with the same key).
+```
+
+</details>
+
 ## Usage
 
 ```sh
