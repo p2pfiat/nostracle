@@ -2,6 +2,7 @@
 //! publish both to nostr (draft DLC oracle NIP, kinds 88 / 89), rebroadcast, archive.
 
 use crate::config::Config;
+use crate::dispute;
 use crate::feeds::{self, Feeds};
 use crate::nip88;
 use crate::price::{self, Fiat};
@@ -12,8 +13,8 @@ use anyhow::{anyhow, Context, Result};
 use kormir::storage::Storage;
 use kormir::{EventDescriptor, Oracle};
 use nostr_sdk::prelude::*;
-use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,11 +79,13 @@ fn unit_of(ev: &kormir::storage::OracleEventData) -> Option<String> {
 pub struct Service {
     pub cfg: Config,
     pub oracle: Oracle<FileStorage>,
+    oracle_sk: kormir::bitcoin::secp256k1::SecretKey,
     http: reqwest::Client,
     nostr: Option<Client>,
     /// Key of our Lightning address provider, which signs zap receipts.
     zapper: Option<PublicKey>,
     last_zap_scan: Cell<u64>,
+    seen_dispute_wraps: RefCell<HashSet<EventId>>,
 }
 
 /// May this event's attestation be published for everyone at time `t`?
@@ -142,7 +145,16 @@ impl Service {
             }),
             _ => None,
         };
-        Ok(Self { cfg, oracle, http, nostr, zapper, last_zap_scan: Cell::new(0) })
+        Ok(Self {
+            cfg,
+            oracle,
+            oracle_sk: key,
+            http,
+            nostr,
+            zapper,
+            last_zap_scan: Cell::new(0),
+            seen_dispute_wraps: RefCell::new(HashSet::new()),
+        })
     }
 
     pub async fn publish_profile(&self) -> Result<()> {
@@ -199,6 +211,9 @@ impl Service {
         // A failing relay or zap scan must never hold up attesting.
         if let Err(e) = self.process_zaps(t).await {
             log::warn!("zap scan: {e:#}");
+        }
+        if let Err(e) = self.process_disputes(t).await {
+            log::warn!("dispute scan: {e:#}");
         }
         self.attest(t).await?;
         self.publish(t).await?;
@@ -616,6 +631,103 @@ impl Service {
                     log::info!("delivered attestation {id}");
                 }
                 Err(e) => log::warn!("deliver {id}: {e:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Listen for incoming NIP-17 `sign_dispute` RPC requests (BIP-342 Leaf 2 On-Demand Disputes)
+    /// and reply with a verified BIP-340 Schnorr signature at the live aggregated spot price.
+    async fn process_disputes(&self, t: u64) -> Result<()> {
+        let Some(client) = &self.nostr else { return Ok(()) };
+        let own_pk = self.oracle.nostr_keys().public_key();
+        let filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(own_pk)
+            .since(Timestamp::from(t.saturating_sub(600)))
+            .limit(50);
+        let events = client
+            .fetch_events(filter, Duration::from_secs(4))
+            .await
+            .context("fetch kind-1059 dispute requests")?;
+
+        let mut cached_feeds: Option<Feeds> = None;
+        let mut cached_spots: HashMap<String, Result<f64, String>> = HashMap::new();
+        let min_fee_sats = self.cfg.pricing.as_ref().map(|p| p.attestation_sats).unwrap_or(0);
+
+        for ev in events.into_iter() {
+            if !self.seen_dispute_wraps.borrow_mut().insert(ev.id) {
+                continue;
+            }
+            let Ok(unwrapped) = client.unwrap_gift_wrap(&ev).await else {
+                continue;
+            };
+            let Some(rpc) = dispute::parse_dispute_rpc(&unwrapped.rumor.content) else {
+                continue;
+            };
+            let cur_code = rpc.params.currency.to_uppercase();
+            let fiat_opt = self
+                .cfg
+                .pairs
+                .iter()
+                .copied()
+                .find(|p| p.code().eq_ignore_ascii_case(&cur_code));
+            let reply_json = match fiat_opt {
+                None => serde_json::to_string(&dispute::DisputeRpcResponse {
+                    msg_type: "p2pfiat-rpc-res".into(),
+                    req_id: rpc.req_id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(format!("unsupported currency {cur_code}")),
+                })
+                .unwrap_or_default(),
+                Some(fiat) => {
+                    if !cached_spots.contains_key(&cur_code) {
+                        if cached_feeds.is_none() {
+                            cached_feeds = Some(feeds::fetch_feeds(&self.cfg.nostr_feeds, t).await);
+                        }
+                        let quotes = feeds::collect_quotes(
+                            &self.http,
+                            fiat,
+                            cached_feeds.as_ref().expect("just fetched"),
+                        )
+                        .await;
+                        let agg = price::aggregate(
+                            &quotes,
+                            self.cfg.min_sources,
+                            self.cfg.min_agreeing,
+                            self.cfg.max_deviation,
+                        )
+                        .map_err(|e| format!("{e:#}"));
+                        cached_spots.insert(cur_code.clone(), agg);
+                    }
+                    match cached_spots.get(&cur_code) {
+                        Some(Ok(live_spot)) => {
+                            log::info!(
+                                "signing on-demand dispute {} ({cur_code} @ {live_spot:.2})",
+                                rpc.params.contract_id
+                            );
+                            dispute::build_dispute_rpc_reply(
+                                &self.oracle_sk,
+                                &rpc,
+                                *live_spot,
+                                min_fee_sats,
+                            )
+                        }
+                        Some(Err(err)) => serde_json::to_string(&dispute::DisputeRpcResponse {
+                            msg_type: "p2pfiat-rpc-res".into(),
+                            req_id: rpc.req_id.clone(),
+                            ok: false,
+                            result: None,
+                            error: Some(format!("price unavailable: {err}")),
+                        })
+                        .unwrap_or_default(),
+                        None => continue,
+                    }
+                }
+            };
+            if let Err(e) = client.send_private_msg(unwrapped.sender, reply_json, []).await {
+                log::warn!("dispute reply to {}: {e:#}", unwrapped.sender);
             }
         }
         Ok(())

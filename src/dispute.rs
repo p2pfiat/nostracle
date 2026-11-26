@@ -126,6 +126,69 @@ pub fn evaluate_and_sign_dispute(
     })
 }
 
+/// NIP-17 RPC envelope compatible with p2pFiat's `Nip17Peer`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisputeRpcRequest {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    pub method: String,
+    pub params: DisputeRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisputeRpcResponse {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<DisputeResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Try to parse a NIP-17 rumor content string as a `sign_dispute` RPC request.
+/// Returns `None` for unrelated DMs so other NIP-17 traffic is ignored cleanly.
+pub fn parse_dispute_rpc(content: &str) -> Option<DisputeRpcRequest> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    if v.get("type")?.as_str()? != "p2pfiat-rpc-req" {
+        return None;
+    }
+    if v.get("method")?.as_str()? != "sign_dispute" {
+        return None;
+    }
+    serde_json::from_value(v).ok()
+}
+
+/// Build a JSON `p2pfiat-rpc-res` reply for a parsed `DisputeRpcRequest`.
+pub fn build_dispute_rpc_reply(
+    oracle_sk: &SecretKey,
+    rpc: &DisputeRpcRequest,
+    live_spot_price: f64,
+    min_fee_sats: u64,
+) -> String {
+    let reply = match evaluate_and_sign_dispute(oracle_sk, &rpc.params, live_spot_price, min_fee_sats) {
+        Ok(res) => DisputeRpcResponse {
+            msg_type: "p2pfiat-rpc-res".into(),
+            req_id: rpc.req_id.clone(),
+            ok: true,
+            result: Some(res),
+            error: None,
+        },
+        Err(e) => DisputeRpcResponse {
+            msg_type: "p2pfiat-rpc-res".into(),
+            req_id: rpc.req_id.clone(),
+            ok: false,
+            result: None,
+            error: Some(format!("{e:#}")),
+        },
+    };
+    serde_json::to_string(&reply).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
