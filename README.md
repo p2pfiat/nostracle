@@ -177,5 +177,9 @@ cargo build
 - [ ] More pairs, configurable sources, signed source quotes in a kind-30078 tick event
 - [ ] k-of-n deployment guide (several independent nostracles)
 
+## License
+
+Licensed under the **Business Source License 1.1 (BSL 1.1)** — see [`LICENSE`](LICENSE). Non-commercial use, auditing, and free/testnet oracle operation are permitted; commercial production use requires a separate license from `p2pFiat`. Converts automatically to **AGPL-3.0** on `2030-11-26`.
+
 Part of [p2pFiat](https://github.com/p2pfiat/p2pFiat): see its
 `docs/ark-architecture.md` for how the oracle fits a fiat-stable balance on Ark.
