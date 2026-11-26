@@ -1,17 +1,28 @@
-//! On-Demand BIP-342 Dispute signing for long-term Arkade DLC contracts (Leaf 3).
+//! On-Demand BIP-342 Dispute signing for long-term Arkade DLC contracts (Leaf 2).
 //!
 //! When a counterparty goes offline mid-term (e.g. day 5 of a 30-day contract) or BTC drops
 //! >= 50% (early liquidation), a user or Watchtower submits a `DisputeRequest` containing the
-//! BIP-342 Tapscript sighash of the payout tx. Each oracle in the `k-of-n` quorum independently:
+//! full unsigned Bitcoin payout transaction (`raw_tx_hex`) plus the spent VTXO script and
+//! Leaf 2 Tapscript. Each oracle in the `k-of-n` quorum independently:
 //! 1. Verifies the dispute fee (`fee_paid_sats >= min_fee_sats`),
-//! 2. Computes the fair payout at the live aggregated spot price (including pro-rata yield/funding),
-//! 3. Signs the 32-byte BIP-342 sighash with its BIP-340 Schnorr key.
+//! 2. Deserializes the Bitcoin transaction and checks input/output structure,
+//! 3. Computes the fair payout at the live aggregated spot price (including pro-rata yield/funding),
+//! 4. Verifies that `tx.output[0]` (User), `tx.output[1]` (LP), and optional `tx.output[2]` (bounty)
+//!    match the fair payout within ±1 sat (preventing output tampering / fund theft),
+//! 5. Independently computes the BIP-341/BIP-342 Tapscript sighash (`SIGHASH_DEFAULT`, leaf 0xc0)
+//!    and signs ONLY that computed sighash with its BIP-340 Schnorr key.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+use kormir::bitcoin::consensus::deserialize;
+use kormir::bitcoin::hashes::Hash;
 use kormir::bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+use kormir::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use kormir::bitcoin::taproot::{LeafVersion, TapLeafHash};
+use kormir::bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use serde::{Deserialize, Serialize};
 
 const DUST_SATS: u64 = 350;
+const PAYOUT_TOLERANCE_SATS: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisputeRequest {
@@ -27,8 +38,22 @@ pub struct DisputeRequest {
     pub funding_rate_bps_per_day: f64,
     pub bounty_sats: u64,
     pub fee_paid_sats: u64,
-    /// 32-byte BIP-342 Tapscript sighash (64 hex chars).
-    pub sighash_hex: String,
+    /// Full unsigned consensus-serialized Bitcoin payout transaction (hex).
+    pub raw_tx_hex: String,
+    /// Spent DLC VTXO P2TR `scriptPubKey` (hex).
+    pub vtxo_pk_script_hex: String,
+    /// BIP-342 Leaf 2 Tapscript (`<csv> OP_CSV OP_DROP <O1> OP_CHECKSIG ... <k> OP_GREATERTHANOREQUAL`).
+    pub dispute_script_hex: String,
+    /// Optional expected User payout scriptPubKey (hex) for extra binding verification.
+    #[serde(default)]
+    pub user_payout_script_hex: Option<String>,
+    /// Optional expected LP payout scriptPubKey (hex) for extra binding verification.
+    #[serde(default)]
+    pub lp_payout_script_hex: Option<String>,
+    /// Optional client-computed 32-byte BIP-342 sighash (64 hex chars); if present, must
+    /// match the oracle's independently computed sighash byte-for-byte.
+    #[serde(default)]
+    pub sighash_hex: Option<String>,
 }
 
 fn default_side() -> String {
@@ -83,7 +108,8 @@ pub fn compute_dispute_payouts(req: &DisputeRequest, live_spot_price: f64) -> Re
     Ok((user_sats, lp_sats, accrued_fiat))
 }
 
-/// Verify fee payment and sign an On-Demand BIP-342 Dispute sighash with BIP-340 Schnorr.
+/// Independently verify tx outputs against the live fair payout, recompute the BIP-342
+/// Tapscript sighash (`SIGHASH_DEFAULT`, leaf 0xc0), and sign with BIP-340 Schnorr.
 pub fn evaluate_and_sign_dispute(
     oracle_sk: &SecretKey,
     req: &DisputeRequest,
@@ -97,17 +123,110 @@ pub fn evaluate_and_sign_dispute(
             min_fee_sats
         );
     }
-    let sighash_bytes = hex::decode(req.sighash_hex.trim()).context("invalid sighash_hex")?;
-    if sighash_bytes.len() != 32 {
-        bail!("sighash_hex must be 32 bytes, got {}", sighash_bytes.len());
-    }
-    let (user_payout_sats, lp_payout_sats, accrued_fiat) =
+
+    let (expected_user, expected_lp, accrued_fiat) =
         compute_dispute_payouts(req, live_spot_price)?;
 
+    // 1. Deserialize and validate the Bitcoin transaction structure
+    let raw_tx_bytes = hex::decode(req.raw_tx_hex.trim()).context("invalid raw_tx_hex")?;
+    let tx: Transaction =
+        deserialize(&raw_tx_bytes).context("failed to deserialize Bitcoin dispute transaction")?;
+    ensure!(
+        tx.input.len() == 1,
+        "dispute tx must have exactly 1 input (got {})",
+        tx.input.len()
+    );
+    let expected_outs = if req.bounty_sats > 0 { 3 } else { 2 };
+    ensure!(
+        tx.output.len() == expected_outs,
+        "dispute tx must have exactly {expected_outs} outputs (got {})",
+        tx.output.len()
+    );
+
+    // 2. Verify every output amount matches the independently computed fair payout (±1 sat rounding)
+    let actual_user = tx.output[0].value.to_sat();
+    let actual_lp = tx.output[1].value.to_sat();
+    ensure!(
+        actual_user.abs_diff(expected_user) <= PAYOUT_TOLERANCE_SATS,
+        "output[0] user payout mismatch: tx has {actual_user} sats, fair payout is {expected_user} sats at spot {live_spot_price:.2}"
+    );
+    ensure!(
+        actual_lp.abs_diff(expected_lp) <= PAYOUT_TOLERANCE_SATS,
+        "output[1] lp payout mismatch: tx has {actual_lp} sats, fair payout is {expected_lp} sats at spot {live_spot_price:.2}"
+    );
+    if req.bounty_sats > 0 {
+        let actual_bounty = tx.output[2].value.to_sat();
+        ensure!(
+            actual_bounty == req.bounty_sats,
+            "output[2] watchtower bounty mismatch: tx has {actual_bounty} sats, expected {} sats",
+            req.bounty_sats
+        );
+    }
+    ensure!(
+        actual_user + actual_lp + req.bounty_sats <= req.total_collateral_sats,
+        "dispute tx outputs exceed total_collateral_sats"
+    );
+
+    // 3. Verify payout scripts (non-empty, and exact match if caller supplied expected scripts)
+    ensure!(!tx.output[0].script_pubkey.is_empty(), "output[0] script_pubkey is empty");
+    ensure!(!tx.output[1].script_pubkey.is_empty(), "output[1] script_pubkey is empty");
+    if let Some(u_hex) = &req.user_payout_script_hex {
+        let u_bytes = hex::decode(u_hex.trim()).context("invalid user_payout_script_hex")?;
+        ensure!(
+            tx.output[0].script_pubkey.as_bytes() == u_bytes.as_slice(),
+            "output[0] script_pubkey does not match user_payout_script_hex"
+        );
+    }
+    if let Some(l_hex) = &req.lp_payout_script_hex {
+        let l_bytes = hex::decode(l_hex.trim()).context("invalid lp_payout_script_hex")?;
+        ensure!(
+            tx.output[1].script_pubkey.as_bytes() == l_bytes.as_slice(),
+            "output[1] script_pubkey does not match lp_payout_script_hex"
+        );
+    }
+
+    // 4. Independently compute the BIP-341 / BIP-342 Tapscript sighash (SIGHASH_DEFAULT, leaf 0xc0)
+    let vtxo_pk_bytes =
+        hex::decode(req.vtxo_pk_script_hex.trim()).context("invalid vtxo_pk_script_hex")?;
+    let dispute_script_bytes =
+        hex::decode(req.dispute_script_hex.trim()).context("invalid dispute_script_hex")?;
+    ensure!(!vtxo_pk_bytes.is_empty(), "vtxo_pk_script_hex must be non-empty");
+    ensure!(!dispute_script_bytes.is_empty(), "dispute_script_hex must be non-empty");
+
+    let prevout = TxOut {
+        value: Amount::from_sat(req.total_collateral_sats),
+        script_pubkey: ScriptBuf::from_bytes(vtxo_pk_bytes),
+    };
+    let dispute_script = ScriptBuf::from_bytes(dispute_script_bytes);
+    let leaf_hash = TapLeafHash::from_script(&dispute_script, LeafVersion::TapScript);
+
+    let mut cache = SighashCache::new(&tx);
+    let sighash = cache
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&[prevout]),
+            leaf_hash,
+            TapSighashType::Default,
+        )
+        .context("failed to compute BIP-342 tapscript sighash")?;
+    let sighash_bytes: [u8; 32] = sighash.to_byte_array();
+    let computed_sighash_hex = hex::encode(sighash_bytes);
+
+    if let Some(claimed) = &req.sighash_hex {
+        let trimmed = claimed.trim().to_lowercase();
+        if !trimmed.is_empty() {
+            ensure!(
+                trimmed == computed_sighash_hex,
+                "sighash mismatch: client claimed {trimmed}, oracle computed {computed_sighash_hex}"
+            );
+        }
+    }
+
+    // 5. Sign ONLY the oracle-computed BIP-342 sighash with BIP-340 Schnorr
     let secp = Secp256k1::new();
     let kp = Keypair::from_secret_key(&secp, oracle_sk);
     let (xonly, _) = kp.x_only_public_key();
-    let msg = Message::from_digest_slice(&sighash_bytes).context("invalid 32-byte digest")?;
+    let msg = Message::from_digest(sighash_bytes);
     let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
     secp.verify_schnorr(&sig, &msg, &xonly)
         .context("self-verification of BIP-340 dispute signature failed")?;
@@ -117,11 +236,11 @@ pub fn evaluate_and_sign_dispute(
         oracle_pubkey_hex: hex::encode(xonly.serialize()),
         currency: req.currency.to_uppercase(),
         live_spot_price,
-        user_payout_sats,
-        lp_payout_sats,
+        user_payout_sats: actual_user,
+        lp_payout_sats: actual_lp,
         bounty_sats: req.bounty_sats,
         accrued_fiat,
-        sighash_hex: req.sighash_hex.trim().to_lowercase(),
+        sighash_hex: computed_sighash_hex,
         signature_hex: hex::encode(sig.as_ref()),
     })
 }
@@ -192,41 +311,78 @@ pub fn build_dispute_rpc_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kormir::bitcoin::absolute::LockTime;
+    use kormir::bitcoin::consensus::serialize;
+    use kormir::bitcoin::transaction::Version;
+    use kormir::bitcoin::{OutPoint, Sequence, TxIn, Txid, Witness};
 
     fn test_sk() -> SecretKey {
         SecretKey::from_slice(&[0x22; 32]).unwrap()
     }
 
-    fn base_req() -> DisputeRequest {
-        DisputeRequest {
+    fn p2tr_script(fill: u8) -> ScriptBuf {
+        let mut bytes = vec![0x51, 0x20];
+        bytes.extend_from_slice(&[fill; 32]);
+        ScriptBuf::from_bytes(bytes)
+    }
+
+    fn build_valid_req(side: &str, funding: f64, live_spot: f64, bounty: u64) -> DisputeRequest {
+        let mut req = DisputeRequest {
             contract_id: "pos-demo-1".into(),
             currency: "USD".into(),
-            side: "short".into(),
+            side: side.into(),
             total_collateral_sats: 333_334,
             notional_fiat: 100.0,
             opened_at: 1_795_000_000,
             dispute_timestamp: 1_795_000_000 + 5 * 86_400,
-            funding_rate_bps_per_day: 3.0,
-            bounty_sats: 600,
+            funding_rate_bps_per_day: funding,
+            bounty_sats: bounty,
             fee_paid_sats: 150,
-            sighash_hex: "ab".repeat(32),
+            raw_tx_hex: String::new(),
+            vtxo_pk_script_hex: hex::encode(p2tr_script(0xaa).as_bytes()),
+            dispute_script_hex: hex::encode([0x51u8]), // minimal valid tapscript for unit test
+            user_payout_script_hex: Some(hex::encode(p2tr_script(0x11).as_bytes())),
+            lp_payout_script_hex: Some(hex::encode(p2tr_script(0x22).as_bytes())),
+            sighash_hex: None,
+        };
+        let (u_sats, l_sats, _) = compute_dispute_payouts(&req, live_spot).unwrap();
+        let mut outputs = vec![
+            TxOut { value: Amount::from_sat(u_sats), script_pubkey: p2tr_script(0x11) },
+            TxOut { value: Amount::from_sat(l_sats), script_pubkey: p2tr_script(0x22) },
+        ];
+        if bounty > 0 {
+            outputs.push(TxOut { value: Amount::from_sat(bounty), script_pubkey: p2tr_script(0x33) });
         }
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::all_zeros(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_consensus((1 << 22) | 4),
+                witness: Witness::new(),
+            }],
+            output: outputs,
+        };
+        req.raw_tx_hex = hex::encode(serialize(&tx));
+        req
     }
 
     #[test]
-    fn signs_mid_term_anytime_exit() {
+    fn signs_mid_term_anytime_exit_with_verified_bip342_sighash() {
         let sk = test_sk();
-        let req = base_req();
+        let req = build_valid_req("short", 3.0, 72_000.0, 600);
         let res = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap();
         let user_usd = (res.user_payout_sats as f64 / 1e8) * 72_000.0;
         assert!((user_usd - 100.15).abs() < 0.05, "got {user_usd}");
         assert_eq!(res.signature_hex.len(), 128);
+        assert_eq!(res.sighash_hex.len(), 64);
     }
 
     #[test]
     fn early_liquidation_pays_full_pool_to_stable() {
         let sk = test_sk();
-        let req = base_req();
+        let req = build_valid_req("short", 3.0, 27_000.0, 600);
         let res = evaluate_and_sign_dispute(&sk, &req, 27_000.0, 100).unwrap();
         assert_eq!(res.user_payout_sats, 333_334 - 600 - DUST_SATS);
         assert_eq!(res.lp_payout_sats, DUST_SATS);
@@ -235,11 +391,8 @@ mod tests {
     #[test]
     fn supports_2x_long_side() {
         let sk = test_sk();
-        let mut req = base_req();
-        req.side = "long".into();
-        req.funding_rate_bps_per_day = -3.0;
+        let req = build_valid_req("long", -3.0, 72_000.0, 600);
         let res = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap();
-        // BTC +20% -> 2x Long user gets ~$140 minus bounty & small funding
         let user_usd = (res.user_payout_sats as f64 / 1e8) * 72_000.0;
         assert!(user_usd > 138.5 && user_usd < 140.5, "got {user_usd}");
     }
@@ -247,8 +400,26 @@ mod tests {
     #[test]
     fn rejects_underpaid_dispute_fee() {
         let sk = test_sk();
-        let mut req = base_req();
-        req.fee_paid_sats = 50;
+        let mut req = build_valid_req("short", 3.0, 72_000.0, 600);
+        req.fee_paid_sats = 25;
         assert!(evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).is_err());
+    }
+
+    #[test]
+    fn rejects_tampered_output_theft_attempt() {
+        let sk = test_sk();
+        // Attacker builds tx at a fake favorable spot ($40k) while real live spot is $72k
+        let req = build_valid_req("short", 3.0, 40_000.0, 600);
+        let err = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap_err();
+        assert!(err.to_string().contains("payout mismatch"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn rejects_tampered_sighash_claim() {
+        let sk = test_sk();
+        let mut req = build_valid_req("short", 3.0, 72_000.0, 600);
+        req.sighash_hex = Some("ff".repeat(32));
+        let err = evaluate_and_sign_dispute(&sk, &req, 72_000.0, 100).unwrap_err();
+        assert!(err.to_string().contains("sighash mismatch"), "unexpected err: {err}");
     }
 }
