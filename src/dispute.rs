@@ -1063,4 +1063,30 @@ mod tests {
         .unwrap();
         assert_eq!(q.manifest_version, 1);
     }
+
+    /// Cross-language vector shared with p2pFiat `mvp/test/dispute-manifest-v2.test.mjs`
+    /// and `watchtower/src/dispute.rs`: all three must hash a v2 manifest identically.
+    #[test]
+    fn manifest_v2_hash_matches_cross_language_vector() {
+        let mut req = build_valid_req("short", 3.0, 72_000.0, 0);
+        req.contract_id = "pos-vector-1".into();
+        req.vtxo_outpoint = format!("{}:0", "aa".repeat(32));
+        req.currency = "USD".into();
+        req.total_collateral_sats = 333_334;
+        req.notional_fiat = 100.0;
+        req.opened_at = 1_795_000_000;
+        req.funding_rate_bps_per_day = 3.0;
+        req.user_pubkey_hex = "11".repeat(32);
+        req.lp_pubkey_hex = "22".repeat(32);
+        req.vtxo_pk_script_hex = format!("5120{}", "33".repeat(32));
+        req.dispute_script_hex = "51".into();
+        req.user_payout_script_hex = format!("5120{}", "44".repeat(32));
+        req.lp_payout_script_hex = format!("5120{}", "55".repeat(32));
+        req.manifest_version = 2;
+        req.dispute_leaf_hashes_hex = vec!["bb".repeat(32), "aa".repeat(32), "CC".repeat(32)];
+        assert_eq!(
+            hex::encode(compute_manifest_hash(&req)),
+            "362770732e8595c4c6c159e5aa17b142188bbd8e1ed09f7fde9547b801005116"
+        );
+    }
 }
